@@ -106,3 +106,16 @@ fn test_comparison_with_jsonschema() {
         );
     }
 }
+
+#[test]
+fn inspect_error() {
+    let schema_json = serde_json::json!({"type": "string"});
+    let instance = serde_json::json!(123);
+    let compiled = jsonschema::validator_for(&schema_json).unwrap();
+    let result = compiled.validate(&instance);
+    if let Err(errors) = result {
+        for e in errors {
+            println!("{:?}", e);
+        }
+    }
+}

@@ -335,6 +335,12 @@ pub struct LightSchema {
     pub log: Option<Box<LogicConstraints>>,
 }
 
+fn parse_u64(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_f64().filter(|&f| f.fract() == 0.0 && f >= 0.0).map(|f| f as u64)
+    })
+}
+
 impl LightSchema {
     /// Parses a raw `serde_json::Value` into a strongly-typed `LightSchema`.
     /// This method recursively parses subschemas.
@@ -511,11 +517,11 @@ impl LightSchema {
 
         let min_properties = val
             .get("minProperties")
-            .and_then(|v| v.as_u64())
+            .and_then(parse_u64)
             .map(|v| v as usize);
         let max_properties = val
             .get("maxProperties")
-            .and_then(|v| v.as_u64())
+            .and_then(parse_u64)
             .map(|v| v as usize);
         if min_properties.is_some() || max_properties.is_some() {
             has_obj = true;
@@ -566,11 +572,11 @@ impl LightSchema {
 
         let min_items = val
             .get("minItems")
-            .and_then(|v| v.as_u64())
+            .and_then(parse_u64)
             .map(|v| v as usize);
         let max_items = val
             .get("maxItems")
-            .and_then(|v| v.as_u64())
+            .and_then(parse_u64)
             .map(|v| v as usize);
         let unique_items = val.get("uniqueItems").and_then(|v| v.as_bool());
         if min_items.is_some() || max_items.is_some() || unique_items.is_some() {
@@ -594,11 +600,11 @@ impl LightSchema {
         };
         let min_contains = val
             .get("minContains")
-            .and_then(|v| v.as_u64())
+            .and_then(parse_u64)
             .map(|v| v as usize);
         let max_contains = val
             .get("maxContains")
-            .and_then(|v| v.as_u64())
+            .and_then(parse_u64)
             .map(|v| v as usize);
         if min_contains.is_some() || max_contains.is_some() {
             has_arr = true;
@@ -642,11 +648,11 @@ impl LightSchema {
 
         let min_length = val
             .get("minLength")
-            .and_then(|v| v.as_u64())
+            .and_then(parse_u64)
             .map(|v| v as usize);
         let max_length = val
             .get("maxLength")
-            .and_then(|v| v.as_u64())
+            .and_then(parse_u64)
             .map(|v| v as usize);
         let mut pattern = None;
         if let Some(p) = val.get("pattern").and_then(|v| v.as_str()) {
@@ -914,6 +920,10 @@ impl LightSchema {
                     SchemaType::Integer => {
                         if val.is_i64() || val.is_u64() {
                             type_matched = true;
+                        } else if let Some(f) = val.as_f64() {
+                            if f.fract() == 0.0 {
+                                type_matched = true;
+                            }
                         }
                     }
                     SchemaType::Number => {
