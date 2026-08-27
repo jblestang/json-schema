@@ -17,6 +17,8 @@ once_cell = { version = "1.21.4", default-features = false, features = ["alloc"]
 
 [dev-dependencies]
 criterion = "0.8.2"
+jsonschema = "0.52.0"
+schemars = "1.2.2"
 
 [[bench]]
 name = "stress_test"
