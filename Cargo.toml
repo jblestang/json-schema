@@ -1,10 +1,10 @@
 [package]
 name = "light-json-schema"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "A strictly no_std JSON Schema validator for embedded and lightweight async systems"
 license = "MIT"
-repository = "https://github.com/TODO/light-json-schema"
+repository = "https://github.com/jblestang/json-schema"
 keywords = ["json-schema", "no_std", "validation", "json"]
 categories = ["no-std", "parser-implementations"]
 
