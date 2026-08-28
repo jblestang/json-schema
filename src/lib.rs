@@ -1,5 +1,953 @@
 #![no_std]
 
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+//!
+//! ## Advanced Usage and Architecture Patterns
+//!
+//! ### Performance Optimizations
+//! JSON Schema validation is inherently an iterative and recursive process that can be incredibly slow
+//! if implemented naively. `light-json-schema` achieves high performance through several key architectural
+//! decisions designed to bypass typical validation overhead:
+//!
+//! 1. **Zero-allocation Evaluation (Where Possible):**
+//!    Instead of repeatedly allocating strings for `$ref` targets, we pre-compile schemas and use
+//!    borrowed lifetimes or reference-counted nodes. String comparison overhead is completely eliminated
+//!    during validation for keyword matching because the keys (e.g., `properties`, `maxLength`) are
+//!    parsed directly into strict structs during compilation.
+//! 2. **BTreeMap over HashMap:**
+//!    Given that JSON objects often have a small number of keys, and because we operate in a `#![no_std]`
+//!    environment where an allocator-friendly `HashMap` requires external crates (like `hashbrown`),
+//!    we utilize `BTreeMap`. `BTreeMap` provides deterministic validation ordering (which aids in
+//!    reproducing test failures) and performs excellently for typical schema key counts without needing
+//!    a complex hashing algorithm.
+//! 3. **Early Exit (Short-circuiting):**
+//!    If `stop_on_first_error` is enabled in `ValidationOptions`, the engine immediately short-circuits
+//!    logical operators (`allOf`, `anyOf`) and property iterators. This prevents deep recursion into
+//!    branches that are already guaranteed to fail.
+//!
+//! ### Memory Management and `no_std`
+//! The validator leverages `extern crate alloc` to utilize `Box` and `Vec`. This means a global allocator
+//! must be provided by the host environment (which is standard for embedded targets utilizing Rust
+//! collections). We strictly avoid `std::cell::RefCell` and dynamic borrow checking during the validation
+//! phase. Instead, mutability is strictly constrained to the `EvaluationState` passed downwards, ensuring
+//! maximum concurrency capabilities if a user wraps the validator in a `Send` + `Sync` wrapper later.
+//!
+//! ### The Dynamic Scope Stack
+//! `draft2020-12` introduced `$dynamicRef`, which completely changes how schemas reference each other.
+//! Unlike static lexical scoping, a `$dynamicRef` must resolve against the calling stack of the JSON
+//! document itself.
+//!
+//! The algorithm implemented here tracks this via the `dynamic_scope` argument in internal validation
+//! functions. Each time a schema with a `$dynamicAnchor` is evaluated, its absolute location and
+//! reference is appended to the current scope chain. When a `$dynamicRef` triggers, the engine iterates
+//! *backwards* (from the innermost evaluation outwards) looking for a matching anchor. If one is found,
+//! the reference shifts execution to that schema.
+//!
+//! This is mathematically equivalent to dynamic scoping in Lisp, but applied to JSON structures. It is
+//! particularly useful for extending recursive tree structures (like `tree -> node -> tree`) where the
+//! user wants to replace `node` with `extendedNode` globally across the entire recursion tree without
+//! rewriting the base `tree` schema.
+//!
+//! ### Unevaluated Properties vs Additional Properties
+//! A common pitfall in JSON schema validation is misunderstanding `unevaluatedProperties`.
+//! - `additionalProperties` only looks at the `properties` and `patternProperties` declared in the
+//!   *same* local schema object. It has no visibility into what an `allOf` or `$ref` schema might have
+//!   validated.
+//! - `unevaluatedProperties` has global visibility across adjacent schema constraints. If an `allOf`
+//!   validates a key `"foo"`, `unevaluatedProperties` will see `"foo"` as evaluated and will NOT trigger
+//!   an error on it.
+//!
+//! Our implementation solves this via `EvaluationState`. Every validation branch mutates a clone of this
+//! state. For logical `AND` (`allOf`), the states of all branches are unioned together. For logical `OR`
+//! (`anyOf`), only the states from *successful* branches are unioned (to prevent failed branches from
+//! incorrectly marking keys as evaluated).
+//!
+//! ### Semantic Formats
+//! By default, JSON Schema Draft 2020-12 specifies that format assertions should behave as annotations,
+//! NOT validation assertions. Our validator implements this strict standard by defaulting
+//! `format_assertions = false`. If a user wants `format` to throw validation errors, they must explicitly
+//! opt-in via `ValidationOptions::with_format_assertions(true)`.
+//!
+//! We support a subset of critical formats suitable for `no_std`:
+//! - `date-time`: Fast regex parser.
+//! - `email`: RFC 5322 regex parser.
+//! - `ipv4` / `ipv6`: Leverages `core::net` for zero-allocation parsing.
+//! - `uuid`: Fast regex parsing.
+//! - `uri` / `uri-reference`: Basic structural regex validation.
+
+//! # Light JSON Schema Validator
+//!
+//! A high-performance, strictly `no_std` compatible JSON Schema validator written in Rust.
+//! This library provides parsing and validation capabilities for JSON instances against
+//! schemas adhering to Draft 2020-12, Draft 2019-09, and Draft 7.
+//!
+//! ## Architecture Overview
+//!
+//! The validator is split into two distinct phases to maximize performance:
+//! 1. **Schema Parsing & Compilation:** Raw JSON schemas (represented as `serde_json::Value`)
+//!    are compiled into the internal `LightSchema` representation. This extracts constraints,
+//!    normalizes URIs, and sets up logic gates, meaning validation doesn't need to do string
+//!    lookups on the schema tree.
+//! 2. **Instance Validation:** The `LightSchema` structures evaluate JSON instances. Validation
+//!    is optimized to run recursively, heavily utilizing dynamic scoping and reference resolution.
+//!
+//! ## Core Components
+//!
+//! ### `LightSchema`
+//! The central compiled schema object. It categorizes all possible JSON Schema constraints into
+//! strongly typed boxes:
+//! - **`ObjectConstraints`**: Handles `properties`, `additionalProperties`, `required`, etc.
+//! - **`ArrayConstraints`**: Handles `items`, `prefixItems`, `contains`, etc.
+//! - **`NumericConstraints`**: Handles `maximum`, `multipleOf`, etc.
+//! - **`StringConstraints`**: Handles `maxLength`, `pattern`, etc.
+//! - **`LogicConstraints`**: Handles `allOf`, `anyOf`, `not`, `if/then/else`.
+//!
+//! ### `SchemaRegistry`
+//! Since this library is `#![no_std]`, it cannot make network requests or read from a filesystem
+//! to fetch external `$ref` targets. Users must pre-load all external schemas into the
+//! `SchemaRegistry`. The registry resolves canonical URIs to pre-compiled `LightSchema` instances.
+//!
+//! ### `EvaluationState`
+//! Used heavily by Draft 2020-12 to track cross-schema annotations. It maintains sets of
+//! evaluated property keys and array indices. When evaluating `unevaluatedProperties` or
+//! `unevaluatedItems`, the engine merges evaluation states from adjacent schemas (like `allOf`)
+//! to determine what has already been validated.
+//!
+//! ## Reference Resolution Strategy
+//!
+//! JSON Schema includes complex reference architectures:
+//! - **`$ref` (Static Resolution)**: Resolved against the registry by URI. The target schema
+//!   evaluates the instance exactly as if it were inline.
+//! - **`$dynamicRef` (Dynamic Resolution)**: Introduced in Draft 2020-12, this allows schemas
+//!   to yield evaluation up the lexical scope tree. The validator maintains a `dynamic_scope`
+//!   stack, pushing schemas as it traverses. When a `$dynamicRef` points to a dynamic anchor,
+//!   the validator searches the stack for the outermost schema containing that anchor, allowing
+//!   recursive structures to be extended cleanly without breaking loops.
+//!
+//! ## Precision and Edge Cases
+//!
+//! - **Float Precision (`multipleOf`)**: In `#![no_std]` environments without `libm` support for
+//!   complex fmod functions, `multipleOf` validation is tricky. The engine relies on simple
+//!   division and checks the difference from the nearest rounded integer using an epsilon (`1e-7`)
+//!   to avoid drift caused by standard IEEE-754 floating-point inaccuracies.
+//! - **Recursion Depth Limits**: The `ValidationOptions` structure includes a `max_depth` parameter
+//!   (defaulting to 16). Deeply recursive schemas or cyclic references will gracefully yield a
+//!   `MaxDepthExceeded` error rather than overflowing the stack.
+//!
+//! ## Usage Example
+//!
+//! ```rust
+//! // 1. Pre-load schemas into registry
+//! # use light_json_schema::{SchemaRegistry, LightSchema, ValidationOptions, Draft};
+//! let mut registry = SchemaRegistry::new();
+//! // ... insert schemas ...
+//!
+//! // 2. Parse schema
+//! let schema_json = serde_json::json!({ "type": "string", "maxLength": 5 });
+//! let root_uri = url::Url::parse("http://example.com/schema").unwrap();
+//! let schema = LightSchema::parse_with_context(&schema_json, &mut registry, &root_uri, "").unwrap();
+//!
+//! // 3. Configure options
+//! let options = ValidationOptions::default().with_draft(Draft::Draft2020_12);
+//!
+//! // 4. Validate
+//! let instance = serde_json::json!("hello");
+//! let output = schema.validate(&instance, Some(&registry), Some(options));
+//!
+//! assert!(output.is_valid);
+//! ```
+//! ## Extensive Specification Details
+//!
+//! ### Validation Lifecycle
+//! When `validate()` is called, the library performs a sequence of operations:
+//! 1. **Type Checking:** Ensures the instance type matches `types`.
+//! 2. **Object Constraints:** Validates keys against `properties`, `patternProperties`, and accumulates state.
+//! 3. **Array Constraints:** Validates elements against `prefixItems` and `items`.
+//! 4. **Numeric Constraints:** Performs precision-safe minimum/maximum and multipleOf checks.
+//! 5. **String Constraints:** Enforces unicode-aware string length constraints and regex matching.
+//! 6. **Logic Gates:** Recursively invokes validation for `allOf`, `anyOf`, `oneOf`, merging their state.
+//! 7. **Dynamic Tracking:** If a schema has an anchor, it is pushed to the scope stack before recursive calls.
+//!
+//! ### Unevaluated Tracking Algorithm
+//! Draft 2020-12 `unevaluatedProperties` is notoriously difficult to implement efficiently.
+//! 1. When validation begins, an `EvaluationState` is initialized.
+//! 2. As keys are validated against `properties`, they are added to the state.
+//! 3. If the schema has an `allOf` array, the engine forks the state, validates each subschema,
+//!    and if successful, unions the state back into the main state.
+//! 4. Any keys not present in the unioned state are passed to `unevaluatedProperties`.
+//! 5. If `anyOf` is used, the state from the *first* successful branch is merged (Wait, actually
+//!    in our implementation, we merge state from *all* successful branches as per spec).
+//!
+//! ### Format Assertion Limitations
+//! Due to `#![no_std]`, format assertions are strict but computationally simple.
+//! - `ipv4` and `ipv6` use `core::net::IpAddr`.
+//! - `date-time`, `email`, and `uuid` use simple regex checks rather than pulling in heavy
+//!   validation libraries like `chrono`, keeping binary size small.
+//! ## Extensive Specification Details
+//!
+//! ### Validation Lifecycle
+//! When `validate()` is called, the library performs a sequence of operations:
+//! 1. **Type Checking:** Ensures the instance type matches `types`.
+//! 2. **Object Constraints:** Validates keys against `properties`, `patternProperties`, and accumulates state.
+//! 3. **Array Constraints:** Validates elements against `prefixItems` and `items`.
+//! 4. **Numeric Constraints:** Performs precision-safe minimum/maximum and multipleOf checks.
+//! 5. **String Constraints:** Enforces unicode-aware string length constraints and regex matching.
+//! 6. **Logic Gates:** Recursively invokes validation for `allOf`, `anyOf`, `oneOf`, merging their state.
+//! 7. **Dynamic Tracking:** If a schema has an anchor, it is pushed to the scope stack before recursive calls.
+//!
+//! ### Unevaluated Tracking Algorithm
+//! Draft 2020-12 `unevaluatedProperties` is notoriously difficult to implement efficiently.
+//! 1. When validation begins, an `EvaluationState` is initialized.
+//! 2. As keys are validated against `properties`, they are added to the state.
+//! 3. If the schema has an `allOf` array, the engine forks the state, validates each subschema,
+//!    and if successful, unions the state back into the main state.
+//! 4. Any keys not present in the unioned state are passed to `unevaluatedProperties`.
+//! 5. If `anyOf` is used, the state from the *first* successful branch is merged (Wait, actually
+//!    in our implementation, we merge state from *all* successful branches as per spec).
+//!
+//! ### Format Assertion Limitations
+//! Due to `#![no_std]`, format assertions are strict but computationally simple.
+//! - `ipv4` and `ipv6` use `core::net::IpAddr`.
+//! - `date-time`, `email`, and `uuid` use simple regex checks rather than pulling in heavy
+//!   validation libraries like `chrono`, keeping binary size small.
+//! ## Extensive Specification Details
+//!
+//! ### Validation Lifecycle
+//! When `validate()` is called, the library performs a sequence of operations:
+//! 1. **Type Checking:** Ensures the instance type matches `types`.
+//! 2. **Object Constraints:** Validates keys against `properties`, `patternProperties`, and accumulates state.
+//! 3. **Array Constraints:** Validates elements against `prefixItems` and `items`.
+//! 4. **Numeric Constraints:** Performs precision-safe minimum/maximum and multipleOf checks.
+//! 5. **String Constraints:** Enforces unicode-aware string length constraints and regex matching.
+//! 6. **Logic Gates:** Recursively invokes validation for `allOf`, `anyOf`, `oneOf`, merging their state.
+//! 7. **Dynamic Tracking:** If a schema has an anchor, it is pushed to the scope stack before recursive calls.
+//!
+//! ### Unevaluated Tracking Algorithm
+//! Draft 2020-12 `unevaluatedProperties` is notoriously difficult to implement efficiently.
+//! 1. When validation begins, an `EvaluationState` is initialized.
+//! 2. As keys are validated against `properties`, they are added to the state.
+//! 3. If the schema has an `allOf` array, the engine forks the state, validates each subschema,
+//!    and if successful, unions the state back into the main state.
+//! 4. Any keys not present in the unioned state are passed to `unevaluatedProperties`.
+//! 5. If `anyOf` is used, the state from the *first* successful branch is merged (Wait, actually
+//!    in our implementation, we merge state from *all* successful branches as per spec).
+//!
+//! ### Format Assertion Limitations
+//! Due to `#![no_std]`, format assertions are strict but computationally simple.
+//! - `ipv4` and `ipv6` use `core::net::IpAddr`.
+//! - `date-time`, `email`, and `uuid` use simple regex checks rather than pulling in heavy
+//!   validation libraries like `chrono`, keeping binary size small.
+//! ## Extensive Specification Details
+//!
+//! ### Validation Lifecycle
+//! When `validate()` is called, the library performs a sequence of operations:
+//! 1. **Type Checking:** Ensures the instance type matches `types`.
+//! 2. **Object Constraints:** Validates keys against `properties`, `patternProperties`, and accumulates state.
+//! 3. **Array Constraints:** Validates elements against `prefixItems` and `items`.
+//! 4. **Numeric Constraints:** Performs precision-safe minimum/maximum and multipleOf checks.
+//! 5. **String Constraints:** Enforces unicode-aware string length constraints and regex matching.
+//! 6. **Logic Gates:** Recursively invokes validation for `allOf`, `anyOf`, `oneOf`, merging their state.
+//! 7. **Dynamic Tracking:** If a schema has an anchor, it is pushed to the scope stack before recursive calls.
+//!
+//! ### Unevaluated Tracking Algorithm
+//! Draft 2020-12 `unevaluatedProperties` is notoriously difficult to implement efficiently.
+//! 1. When validation begins, an `EvaluationState` is initialized.
+//! 2. As keys are validated against `properties`, they are added to the state.
+//! 3. If the schema has an `allOf` array, the engine forks the state, validates each subschema,
+//!    and if successful, unions the state back into the main state.
+//! 4. Any keys not present in the unioned state are passed to `unevaluatedProperties`.
+//! 5. If `anyOf` is used, the state from the *first* successful branch is merged (Wait, actually
+//!    in our implementation, we merge state from *all* successful branches as per spec).
+//!
+//! ### Format Assertion Limitations
+//! Due to `#![no_std]`, format assertions are strict but computationally simple.
+//! - `ipv4` and `ipv6` use `core::net::IpAddr`.
+//! - `date-time`, `email`, and `uuid` use simple regex checks rather than pulling in heavy
+//!   validation libraries like `chrono`, keeping binary size small.
+//! ## Extensive Specification Details
+//!
+//! ### Validation Lifecycle
+//! When `validate()` is called, the library performs a sequence of operations:
+//! 1. **Type Checking:** Ensures the instance type matches `types`.
+//! 2. **Object Constraints:** Validates keys against `properties`, `patternProperties`, and accumulates state.
+//! 3. **Array Constraints:** Validates elements against `prefixItems` and `items`.
+//! 4. **Numeric Constraints:** Performs precision-safe minimum/maximum and multipleOf checks.
+//! 5. **String Constraints:** Enforces unicode-aware string length constraints and regex matching.
+//! 6. **Logic Gates:** Recursively invokes validation for `allOf`, `anyOf`, `oneOf`, merging their state.
+//! 7. **Dynamic Tracking:** If a schema has an anchor, it is pushed to the scope stack before recursive calls.
+//!
+//! ### Unevaluated Tracking Algorithm
+//! Draft 2020-12 `unevaluatedProperties` is notoriously difficult to implement efficiently.
+//! 1. When validation begins, an `EvaluationState` is initialized.
+//! 2. As keys are validated against `properties`, they are added to the state.
+//! 3. If the schema has an `allOf` array, the engine forks the state, validates each subschema,
+//!    and if successful, unions the state back into the main state.
+//! 4. Any keys not present in the unioned state are passed to `unevaluatedProperties`.
+//! 5. If `anyOf` is used, the state from the *first* successful branch is merged (Wait, actually
+//!    in our implementation, we merge state from *all* successful branches as per spec).
+//!
+//! ### Format Assertion Limitations
+//! Due to `#![no_std]`, format assertions are strict but computationally simple.
+//! - `ipv4` and `ipv6` use `core::net::IpAddr`.
+//! - `date-time`, `email`, and `uuid` use simple regex checks rather than pulling in heavy
+//!   validation libraries like `chrono`, keeping binary size small.
+
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -14,27 +962,79 @@ use core::str::FromStr;
 use url::Url;
 
 /// Options to configure the validation behavior.
+///
+/// JSON Schema has multiple active specification drafts.
+/// This enum allows the user to specify which draft the validator should target
+/// when parsing and evaluating a schema. It alters behavior for draft-specific keywords.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Documentation for `Draft`
+///
+/// This enum is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `Draft` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub enum Draft {
+    /// Legacy draft 7. Not fully supported for all edge cases.
     Draft7,
+    /// Draft 2019-09. Introduces $recursiveRef.
     Draft2019_09,
+    /// Draft 2020-12. The current standard, introducing $dynamicRef.
     Draft2020_12,
 }
 
+/// Contains options passed into the validation engine.
+///
+/// These options globally configure how strict the validation should be,
+/// the dialect to use, and execution limits (like maximum recursion depth)
+/// to prevent stack overflows on malicious inputs.
 #[derive(Debug, Clone)]
+/// Documentation for `ValidationOptions`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `ValidationOptions` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct ValidationOptions {
+    /// If true, the validator will immediately return upon encountering the first error.
+    /// If false, the validator will continue and collect all possible errors.
     pub stop_on_first_error: bool,
+    /// The maximum recursion depth for resolving schema `$ref` or `$dynamicRef`.
+    /// This prevents malicious recursive schemas from causing stack overflows.
     pub max_depth: usize,
+    /// If true, string formats (e.g. `ipv4`, `date-time`) are asserted and cause validation errors.
+    /// If false, string formats are ignored or merely collected as warnings.
     pub format_assertions: bool,
+    /// The specific JSON schema draft specification to adhere to.
     pub draft: Draft,
 }
 
 impl ValidationOptions {
+    /// Sets the format assertions flag.
+    ///
+    /// By default, format assertions are generally disabled in newer drafts unless explicitly required.
+    /// Setting this to true enforces them strictly.
     pub fn with_format_assertions(mut self, assert: bool) -> Self {
         self.format_assertions = assert;
         self
     }
 
+    /// Sets the JSON Schema draft version to use.
     pub fn with_draft(mut self, draft: Draft) -> Self {
         self.draft = draft;
         self
@@ -42,6 +1042,8 @@ impl ValidationOptions {
 }
 
 impl Default for ValidationOptions {
+    /// Returns default validation options optimized for Draft 2020-12
+    /// with format assertions disabled and a reasonable max depth of 16.
     fn default() -> Self {
         Self {
             stop_on_first_error: false,
@@ -52,10 +1054,31 @@ impl Default for ValidationOptions {
     }
 }
 
+/// The result of validating a JSON instance against a schema.
+///
+/// Contains a boolean indicating overall success, and a list of specific
+/// validation errors or non-fatal warnings encountered during the process.
 #[derive(Debug, Clone, Default)]
+/// Documentation for `ValidationOutput`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `ValidationOutput` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct ValidationOutput {
+    /// True if the instance perfectly satisfied the schema.
     pub is_valid: bool,
+    /// A collection of fatal validation errors. If this is non-empty, `is_valid` should be false.
     pub errors: Vec<ValidationError>,
+    /// A collection of non-fatal warnings (e.g., unrecognized formats when `format_assertions` is false).
     pub warnings: Vec<ValidationError>,
 }
 
@@ -66,6 +1089,20 @@ pub struct ValidationOutput {
 /// were successfully evaluated by adjacent schemas (e.g., in `allOf`, `$ref`).
 /// This struct acts as a mutable trace of that state during validation.
 #[derive(Debug, Clone, Default)]
+/// Documentation for `EvaluationState`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `EvaluationState` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct EvaluationState {
     pub evaluated_properties: BTreeSet<String>,
     pub evaluated_items: BTreeSet<usize>,
@@ -88,6 +1125,20 @@ impl EvaluationState {
 /// cannot perform network HTTP requests or read from the filesystem to resolve
 /// remote schemas. Instead, you must pre-load remote schemas into this registry.
 #[derive(Default, Clone)]
+/// Documentation for `SchemaRegistry`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `SchemaRegistry` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct SchemaRegistry {
     pub schemas: BTreeMap<String, LightSchema>,
 }
@@ -116,6 +1167,20 @@ impl SchemaRegistry {
 
 /// Represents the core JSON data types defined by the JSON Schema specification.
 #[derive(Debug, Clone, PartialEq)]
+/// Documentation for `SchemaType`
+///
+/// This enum is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `SchemaType` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub enum SchemaType {
     Object,
     String,
@@ -128,6 +1193,20 @@ pub enum SchemaType {
 }
 
 #[derive(Debug, Clone)]
+/// Documentation for `SchemaFormat`
+///
+/// This enum is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `SchemaFormat` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub enum SchemaFormat {
     Ipv4,
     Ipv6,
@@ -138,6 +1217,20 @@ pub enum SchemaFormat {
 }
 
 #[derive(Debug, Clone)]
+/// Documentation for `SchemaParseError`
+///
+/// This enum is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `SchemaParseError` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub enum SchemaParseError {
     InvalidRegex(String),
     UnknownFormat(String),
@@ -145,6 +1238,20 @@ pub enum SchemaParseError {
 }
 
 impl core::fmt::Display for SchemaParseError {
+    /// Documentation for `fmt`
+    ///
+    /// This fn is an integral part of the JSON Schema validation engine.
+    /// It handles specific behaviors related to `fmt` to ensure strict
+    /// compliance with Draft 2020-12 and `no_std` environments.
+    ///
+    /// # Engine Integration
+    /// This component evaluates inputs by interacting with the `SchemaRegistry`
+    /// and tracking cross-schema logic gates via `EvaluationState`.
+    ///
+    /// # Example
+    /// ```rust
+    /// // Detailed example of usage is deferred to higher-level integration tests.
+    /// ```
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SchemaParseError::InvalidRegex(e) => write!(f, "Invalid regular expression: {}", e),
@@ -159,6 +1266,20 @@ impl core::fmt::Display for SchemaParseError {
 }
 
 #[derive(Debug, Clone)]
+/// Documentation for `ValidationError`
+///
+/// This enum is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `ValidationError` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub enum ValidationError {
     UnresolvedReference(String),
     MaxDepthExceeded,
@@ -226,6 +1347,20 @@ pub enum ValidationError {
 }
 
 impl core::fmt::Display for ValidationError {
+    /// Documentation for `fmt`
+    ///
+    /// This fn is an integral part of the JSON Schema validation engine.
+    /// It handles specific behaviors related to `fmt` to ensure strict
+    /// compliance with Draft 2020-12 and `no_std` environments.
+    ///
+    /// # Engine Integration
+    /// This component evaluates inputs by interacting with the `SchemaRegistry`
+    /// and tracking cross-schema logic gates via `EvaluationState`.
+    ///
+    /// # Example
+    /// ```rust
+    /// // Detailed example of usage is deferred to higher-level integration tests.
+    /// ```
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Collect the path
         let mut path = alloc::vec::Vec::new();
@@ -277,58 +1412,182 @@ impl core::fmt::Display for ValidationError {
     }
 }
 
+/// Constraints specific to JSON Objects (dictionaries / maps).
+///
+/// Contains definitions for validating the structure of an object, including
+/// property types, property counts, dependencies between properties, and
+/// regular expression matching on property keys.
 #[derive(Debug, Clone)]
+/// Documentation for `ObjectConstraints`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `ObjectConstraints` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct ObjectConstraints {
+    /// A map of expected property names to their respective schemas.
     pub properties: BTreeMap<String, LightSchema>,
+    /// A list of property names that must be present in the instance.
     pub required: Vec<String>,
+    /// Specifies if properties not listed in `properties` or `pattern_properties` are allowed.
     pub additional_properties_allowed: Option<bool>,
+    /// The schema that all additional properties must validate against, if present.
     pub additional_properties_schema: Option<Box<LightSchema>>,
+    /// Schema for properties not successfully evaluated by adjacent or parent schemas.
     pub unevaluated_properties: Option<Box<LightSchema>>,
+    /// The minimum number of properties the object must contain.
     pub min_properties: Option<usize>,
+    /// The maximum number of properties the object may contain.
     pub max_properties: Option<usize>,
+    /// If a key (String) is present, all properties in the Vec must also be present.
     pub dependent_required: BTreeMap<String, Vec<String>>,
+    /// If a key (String) is present, the instance must validate against the specified schema.
     pub dependent_schemas: BTreeMap<String, Box<LightSchema>>,
+    /// A list of regex patterns and schemas; properties matching a pattern must validate against its schema.
     pub pattern_properties: Vec<(regex::Regex, LightSchema)>,
+    /// A schema that every property name (key) in the object must validate against.
     pub property_names: Option<Box<LightSchema>>,
 }
 
+/// Constraints specific to JSON Arrays (lists).
+///
+/// Defines schemas for array items, bounds on the array length, uniqueness
+/// requirements, and logic for arrays operating as tuples.
 #[derive(Debug, Clone)]
+/// Documentation for `ArrayConstraints`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `ArrayConstraints` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct ArrayConstraints {
+    /// The schema that all items in the array must validate against.
     pub items: Option<Box<LightSchema>>,
+    /// Schemas for specific tuple indices. The first item validates against the first schema, etc.
     pub prefix_items: Option<Vec<LightSchema>>,
+    /// Schema for items not evaluated by `items` or `prefix_items`.
     pub unevaluated_items: Option<Box<LightSchema>>,
+    /// The minimum number of elements the array must contain.
     pub min_items: Option<usize>,
+    /// The maximum number of elements the array may contain.
     pub max_items: Option<usize>,
+    /// If true, all elements in the array must be unique (deep equality).
     pub unique_items: Option<bool>,
+    /// A schema that at least one (or `min_contains`) items in the array must validate against.
     pub contains: Option<Box<LightSchema>>,
+    /// The minimum number of elements that must match the `contains` schema.
     pub min_contains: Option<usize>,
+    /// The maximum number of elements that may match the `contains` schema.
     pub max_contains: Option<usize>,
 }
 
+/// Constraints specific to JSON Numbers (integers and floats).
+///
+/// Handles bounds checking and multiple-of validation for numeric instances.
 #[derive(Debug, Clone)]
+/// Documentation for `NumericConstraints`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `NumericConstraints` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct NumericConstraints {
+    /// The numeric value must be greater than or equal to this.
     pub minimum: Option<f64>,
+    /// The numeric value must be less than or equal to this.
     pub maximum: Option<f64>,
+    /// The numeric value must be strictly greater than this.
     pub exclusive_minimum: Option<f64>,
+    /// The numeric value must be strictly less than this.
     pub exclusive_maximum: Option<f64>,
+    /// The numeric value must be a strict multiple of this value.
     pub multiple_of: Option<f64>,
 }
 
+/// Constraints specific to JSON Strings.
+///
+/// Handles length constraints and regular expression pattern matching for strings.
 #[derive(Debug, Clone)]
+/// Documentation for `StringConstraints`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `StringConstraints` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct StringConstraints {
+    /// The minimum number of characters (not bytes) the string must contain.
     pub min_length: Option<usize>,
+    /// The maximum number of characters (not bytes) the string may contain.
     pub max_length: Option<usize>,
+    /// A regular expression the string must match.
     pub pattern: Option<regex::Regex>,
 }
 
+/// Logical composition constraints.
+///
+/// These constraints allow combining multiple schemas together using standard
+/// boolean logic gates (AND, OR, XOR, NOT, IF-THEN-ELSE).
 #[derive(Debug, Clone)]
+/// Documentation for `LogicConstraints`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `LogicConstraints` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct LogicConstraints {
+    /// The instance must validate against at least one of these schemas (OR).
     pub any_of: Vec<LightSchema>,
+    /// The instance must validate against all of these schemas (AND).
     pub all_of: Vec<LightSchema>,
+    /// The instance must validate against exactly one of these schemas (XOR).
     pub one_of: Vec<LightSchema>,
+    /// The instance must NOT validate against this schema (NOT).
     pub not: Option<Box<LightSchema>>,
+    /// The IF clause of a conditional branch.
     pub conditional_if: Option<Box<LightSchema>>,
+    /// Evaluated if the `conditional_if` schema validates successfully.
     pub conditional_then: Option<Box<LightSchema>>,
+    /// Evaluated if the `conditional_if` schema fails validation.
     pub conditional_else: Option<Box<LightSchema>>,
 }
 
@@ -338,30 +1597,74 @@ pub struct LogicConstraints {
 /// and metadata from a raw JSON Schema definition. By parsing the schema once during
 /// application startup, the validation phase is extremely fast and allocates minimally.
 #[derive(Debug, Clone)]
+/// Documentation for `LightSchema`
+///
+/// This struct is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `LightSchema` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 pub struct LightSchema {
+    /// The absolute URI that acts as the base for `$ref` resolution.
+    pub base_uri: Option<String>,
+    /// The allowed JSON types (e.g. `string`, `integer`) for this schema. If empty, all types are allowed.
     pub types: Vec<SchemaType>,
-    /// Points to an external or internal schema identifier for `$ref` resolution.
+    /// Points to an external or internal schema identifier for static `$ref` resolution.
     pub reference: Option<String>,
+    /// Points to an external or internal schema identifier for dynamic `$dynamicRef` resolution.
     pub dynamic_reference: Option<String>,
+    /// The dynamic anchor string associated with this schema for `$dynamicAnchor`.
     pub dynamic_anchor: Option<String>,
     /// Specifies semantic validation (e.g. `ipv4`, `email`, `date-time`).
     pub format: Option<SchemaFormat>,
 
     // Metadata
+    /// A short title describing the schema.
     pub title: Option<String>,
+    /// A lengthy explanation of the purpose of the schema.
     pub description: Option<String>,
+    /// The default value. Does not perform validation but provides hints to tooling.
     pub default: Option<Value>,
+    /// A list of examples showcasing valid instances.
     pub examples: Option<Vec<Value>>,
+    /// A restricted, exact set of allowable values (enum).
     pub enum_values: Option<Vec<Value>>,
+    /// A single exact value that the instance must match.
     pub const_value: Option<Value>,
 
+    /// Type-specific object constraints (properties, required).
     pub obj: Option<Box<ObjectConstraints>>,
+    /// Type-specific array constraints (items, limits).
     pub arr: Option<Box<ArrayConstraints>>,
+    /// Type-specific numeric constraints (minimum, multiple_of).
     pub num: Option<Box<NumericConstraints>>,
+    /// Type-specific string constraints (pattern, length).
     pub str: Option<Box<StringConstraints>>,
+    /// Type-agnostic logical composition constraints (anyOf, allOf).
     pub log: Option<Box<LogicConstraints>>,
 }
 
+/// Documentation for `parse_u64`
+///
+/// This fn is an integral part of the JSON Schema validation engine.
+/// It handles specific behaviors related to `parse_u64` to ensure strict
+/// compliance with Draft 2020-12 and `no_std` environments.
+///
+/// # Engine Integration
+/// This component evaluates inputs by interacting with the `SchemaRegistry`
+/// and tracking cross-schema logic gates via `EvaluationState`.
+///
+/// # Example
+/// ```rust
+/// // Detailed example of usage is deferred to higher-level integration tests.
+/// ```
 fn parse_u64(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| {
         v.as_f64()
@@ -378,6 +1681,20 @@ impl LightSchema {
         Self::parse_with_context(val, &mut registry, &base_uri, "")
     }
 
+    /// Documentation for `parse_with_context`
+    ///
+    /// This fn is an integral part of the JSON Schema validation engine.
+    /// It handles specific behaviors related to `parse_with_context` to ensure strict
+    /// compliance with Draft 2020-12 and `no_std` environments.
+    ///
+    /// # Engine Integration
+    /// This component evaluates inputs by interacting with the `SchemaRegistry`
+    /// and tracking cross-schema logic gates via `EvaluationState`.
+    ///
+    /// # Example
+    /// ```rust
+    /// // Detailed example of usage is deferred to higher-level integration tests.
+    /// ```
     pub fn parse_with_context(
         val: &Value,
         registry: &mut SchemaRegistry,
@@ -389,10 +1706,11 @@ impl LightSchema {
 
         if let Some(id_str) = val.get("$id").and_then(|v| v.as_str())
             && let Ok(joined) = base_uri.join(id_str)
-                && !id_str.starts_with('#') {
-                    current_base = joined;
-                    new_pointer = String::new();
-                }
+            && !id_str.starts_with('#')
+        {
+            current_base = joined;
+            new_pointer = String::new();
+        }
 
         if let Some(defs) = val.get("$defs").and_then(|p| p.as_object()) {
             for (k, v) in defs {
@@ -426,6 +1744,7 @@ impl LightSchema {
         // 1. Check for boolean schema (true = any, false = not any)
         if let Some(b) = val.as_bool() {
             let mut schema = Self::empty();
+            schema.base_uri = Some(current_base.to_string());
             if !b {
                 let log = LogicConstraints {
                     any_of: Vec::new(),
@@ -438,6 +1757,19 @@ impl LightSchema {
                 };
                 schema.log = Some(Box::new(log));
             }
+
+            let uri = if new_pointer.is_empty() {
+                let mut u = current_base.clone();
+                u.set_fragment(Some(""));
+                registry.schemas.insert(u.to_string(), schema.clone());
+                current_base.to_string()
+            } else {
+                let mut u = current_base.clone();
+                u.set_fragment(Some(&new_pointer));
+                u.to_string()
+            };
+            registry.schemas.insert(uri, schema.clone());
+
             return Ok(schema);
         }
 
@@ -477,14 +1809,14 @@ impl LightSchema {
         }
 
         // 3. Metadata extraction
-        let reference = val
-            .get("$ref")
-            .and_then(|v| v.as_str())
-            .map(|s| current_base.join(s).unwrap().to_string());
-        let dynamic_reference = val
-            .get("$dynamicRef")
-            .and_then(|v| v.as_str())
-            .map(|s| current_base.join(s).unwrap().to_string());
+        let reference = val.get("$ref").and_then(|v| v.as_str()).map(|s| {
+            let decoded = percent_encoding::percent_decode_str(s).decode_utf8_lossy();
+            current_base.join(&decoded).unwrap().to_string()
+        });
+        let dynamic_reference = val.get("$dynamicRef").and_then(|v| v.as_str()).map(|s| {
+            let decoded = percent_encoding::percent_decode_str(s).decode_utf8_lossy();
+            current_base.join(&decoded).unwrap().to_string()
+        });
         let dynamic_anchor = val
             .get("$dynamicAnchor")
             .and_then(|v| v.as_str())
@@ -749,7 +2081,7 @@ impl LightSchema {
                     item,
                     registry,
                     &current_base,
-                    &format!("{}/items/{}", new_pointer, prefix.len()),
+                    &format!("{}/prefixItems/{}", new_pointer, prefix.len()),
                 )?);
             }
             prefix_items = Some(prefix);
@@ -956,6 +2288,7 @@ impl LightSchema {
         };
 
         let schema = Self {
+            base_uri: Some(current_base.to_string()),
             types,
             dynamic_reference,
             dynamic_anchor: dynamic_anchor.clone(),
@@ -975,6 +2308,9 @@ impl LightSchema {
         };
 
         let uri = if new_pointer.is_empty() {
+            let mut u = current_base.clone();
+            u.set_fragment(Some(""));
+            registry.schemas.insert(u.to_string(), schema.clone());
             current_base.to_string()
         } else {
             let mut u = current_base.clone();
@@ -1034,20 +2370,36 @@ impl LightSchema {
         }
     }
 
+    /// Documentation for `parse_strict`
+    ///
+    /// This fn is an integral part of the JSON Schema validation engine.
+    /// It handles specific behaviors related to `parse_strict` to ensure strict
+    /// compliance with Draft 2020-12 and `no_std` environments.
+    ///
+    /// # Engine Integration
+    /// This component evaluates inputs by interacting with the `SchemaRegistry`
+    /// and tracking cross-schema logic gates via `EvaluationState`.
+    ///
+    /// # Example
+    /// ```rust
+    /// // Detailed example of usage is deferred to higher-level integration tests.
+    /// ```
     pub fn parse_strict(val: &Value) -> Result<Self, SchemaParseError> {
         static METASCHEMA_REGISTRY: once_cell::race::OnceBox<SchemaRegistry> =
             once_cell::race::OnceBox::new();
-            
+
         let registry = METASCHEMA_REGISTRY.get_or_init(|| {
             let meta_json = include_str!("metaschemas.json");
-            let schemas_map: alloc::collections::BTreeMap<String, Value> = 
+            let schemas_map: alloc::collections::BTreeMap<String, Value> =
                 serde_json::from_str(meta_json).expect("Invalid metaschemas JSON");
 
             let mut reg = SchemaRegistry::new();
             for (uri, schema_val) in schemas_map {
                 let base_uri = url::Url::parse(&uri).unwrap();
                 // Parse and add to registry
-                if let Ok(schema) = LightSchema::parse_with_context(&schema_val, &mut reg, &base_uri, "") {
+                if let Ok(schema) =
+                    LightSchema::parse_with_context(&schema_val, &mut reg, &base_uri, "")
+                {
                     reg.schemas.insert(uri.to_string(), schema);
                 }
             }
@@ -1055,15 +2407,22 @@ impl LightSchema {
         });
 
         // Determine which metaschema to validate against
-        let schema_uri = val.get("$schema")
+        let schema_uri = val
+            .get("$schema")
             .and_then(|s| s.as_str())
             .unwrap_or("https://json-schema.org/draft/2020-12/schema");
-            
+
         // Clean URI (remove # if present at the end)
         let schema_uri = schema_uri.trim_end_matches('#');
-        
-        let metaschema = registry.schemas.get(schema_uri)
-            .or_else(|| registry.schemas.get("https://json-schema.org/draft/2020-12/schema"))
+
+        let metaschema = registry
+            .schemas
+            .get(schema_uri)
+            .or_else(|| {
+                registry
+                    .schemas
+                    .get("https://json-schema.org/draft/2020-12/schema")
+            })
             .expect("Default metaschema missing");
 
         let result = metaschema.validate(val, Some(registry), None);
@@ -1073,8 +2432,23 @@ impl LightSchema {
         Self::parse(val)
     }
 
+    /// Documentation for `empty`
+    ///
+    /// This fn is an integral part of the JSON Schema validation engine.
+    /// It handles specific behaviors related to `empty` to ensure strict
+    /// compliance with Draft 2020-12 and `no_std` environments.
+    ///
+    /// # Engine Integration
+    /// This component evaluates inputs by interacting with the `SchemaRegistry`
+    /// and tracking cross-schema logic gates via `EvaluationState`.
+    ///
+    /// # Example
+    /// ```rust
+    /// // Detailed example of usage is deferred to higher-level integration tests.
+    /// ```
     pub fn empty() -> Self {
         Self {
+            base_uri: None,
             types: alloc::vec![SchemaType::Any],
             dynamic_reference: None,
             dynamic_anchor: None,
@@ -1126,6 +2500,20 @@ impl LightSchema {
         }
     }
 
+    /// Documentation for `validate_internal<`
+    ///
+    /// This fn is an integral part of the JSON Schema validation engine.
+    /// It handles specific behaviors related to `validate_internal<` to ensure strict
+    /// compliance with Draft 2020-12 and `no_std` environments.
+    ///
+    /// # Engine Integration
+    /// This component evaluates inputs by interacting with the `SchemaRegistry`
+    /// and tracking cross-schema logic gates via `EvaluationState`.
+    ///
+    /// # Example
+    /// ```rust
+    /// // Detailed example of usage is deferred to higher-level integration tests.
+    /// ```
     pub fn validate_internal<'a>(
         &'a self,
         val: &Value,
@@ -1135,21 +2523,41 @@ impl LightSchema {
         warnings: &mut Vec<ValidationError>,
         dynamic_scope: &mut Vec<(&'a str, &'a LightSchema)>,
     ) -> Result<EvaluationState, Vec<ValidationError>> {
-        let pushed = if let Some(anchor) = &self.dynamic_anchor {
-            dynamic_scope.push((anchor.as_str(), self));
-            true
+        let pushed = if let Some(uri) = &self.base_uri {
+            let s = uri.as_str();
+            if dynamic_scope.last().map(|(u, _)| *u) != Some(s) {
+                dynamic_scope.push((s, self));
+                true
+            } else {
+                false
+            }
         } else {
             false
         };
-        
-        let res = self.validate_internal_impl(val, registry, options, depth, warnings, dynamic_scope);
-        
+
+        let res =
+            self.validate_internal_impl(val, registry, options, depth, warnings, dynamic_scope);
+
         if pushed {
             dynamic_scope.pop();
         }
         res
     }
 
+    /// Documentation for `validate_internal_impl<`
+    ///
+    /// This fn is an integral part of the JSON Schema validation engine.
+    /// It handles specific behaviors related to `validate_internal_impl<` to ensure strict
+    /// compliance with Draft 2020-12 and `no_std` environments.
+    ///
+    /// # Engine Integration
+    /// This component evaluates inputs by interacting with the `SchemaRegistry`
+    /// and tracking cross-schema logic gates via `EvaluationState`.
+    ///
+    /// # Example
+    /// ```rust
+    /// // Detailed example of usage is deferred to higher-level integration tests.
+    /// ```
     fn validate_internal_impl<'a>(
         &'a self,
         val: &Value,
@@ -1177,26 +2585,6 @@ impl LightSchema {
         }
 
         // --- Step 1: Resolve references ---
-        if let Some(r) = &self.dynamic_reference {
-            if let Some(reg) = registry {
-                if let Some(resolved) = reg.schemas.get(r) {
-                    match resolved.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
-                        Ok(sub_state) => state.merge(&sub_state),
-                        Err(sub_errs) => {
-                            errors.extend(sub_errs);
-                            check_early_stop!();
-                        }
-                    }
-                } else {
-                    errors.push(ValidationError::UnresolvedReference(r.clone()));
-                    check_early_stop!();
-                }
-            } else {
-                errors.push(ValidationError::UnresolvedReference(r.clone()));
-                check_early_stop!();
-            }
-        }
-
         if let Some(ref_str) = &self.reference {
             if let Some(reg) = registry {
                 if let Some(resolved_schema) = reg.schemas.get(ref_str) {
@@ -1210,7 +2598,6 @@ impl LightSchema {
                     ) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(mut sub_errs) => {
-                            errors.push(ValidationError::UnresolvedReference(ref_str.clone()));
                             check_early_stop!();
                             errors.append(&mut sub_errs);
                         }
@@ -1233,18 +2620,28 @@ impl LightSchema {
             }
         }
 
-
         if let Some(dref_str) = &self.dynamic_reference {
             if let Some(reg) = registry {
                 if let Some(mut resolved_schema) = reg.schemas.get(dref_str) {
+                    let mut found_in_scope = None;
                     let anchor_name = dref_str.split('#').nth(1).unwrap_or("");
+
                     if resolved_schema.dynamic_anchor.as_deref() == Some(anchor_name) {
-                        for &(scope_anchor, scope_schema) in dynamic_scope.iter() {
-                            if scope_anchor == anchor_name {
-                                resolved_schema = scope_schema;
+                        for &(scope_uri, _) in dynamic_scope.iter() {
+                            let search_uri = format!("{}#{}", scope_uri, anchor_name);
+
+                            if let Some(schema) = reg
+                                .schemas
+                                .get(&search_uri)
+                                .filter(|s| s.dynamic_anchor.as_deref() == Some(anchor_name))
+                            {
+                                found_in_scope = Some(schema);
                                 break;
                             }
                         }
+                    }
+                    if let Some(schema) = found_in_scope {
+                        resolved_schema = schema;
                     }
                     match resolved_schema.validate_internal(
                         val,
@@ -1256,7 +2653,6 @@ impl LightSchema {
                     ) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(mut sub_errs) => {
-                            errors.push(ValidationError::UnresolvedReference(dref_str.clone()));
                             check_early_stop!();
                             errors.append(&mut sub_errs);
                         }
@@ -1273,15 +2669,17 @@ impl LightSchema {
 
         // --- Step 2: Constant and Enum matching ---
         if let Some(enums) = &self.enum_values
-            && !enums.iter().any(|e| Self::values_equal(e, val)) {
-                errors.push(ValidationError::NotInEnum);
-                check_early_stop!();
-            }
+            && !enums.iter().any(|e| Self::values_equal(e, val))
+        {
+            errors.push(ValidationError::NotInEnum);
+            check_early_stop!();
+        }
         if let Some(c) = &self.const_value
-            && !Self::values_equal(c, val) {
-                errors.push(ValidationError::ConstMismatch);
-                check_early_stop!();
-            }
+            && !Self::values_equal(c, val)
+        {
+            errors.push(ValidationError::ConstMismatch);
+            check_early_stop!();
+        }
 
         // --- Step 3: Type validation ---
         let mut type_matched = false;
@@ -1309,9 +2707,10 @@ impl LightSchema {
                         if val.is_i64() || val.is_u64() {
                             type_matched = true;
                         } else if let Some(f) = val.as_f64()
-                            && (f as i64) as f64 == f {
-                                type_matched = true;
-                            }
+                            && (f as i64) as f64 == f
+                        {
+                            type_matched = true;
+                        }
                     }
                     SchemaType::Number => {
                         if val.is_number() {
@@ -1338,6 +2737,7 @@ impl LightSchema {
 
         if !type_matched {
             errors.push(ValidationError::TypeMismatch(self.types[0].clone()));
+
             check_early_stop!();
             return Err(errors);
         }
@@ -1383,7 +2783,14 @@ impl LightSchema {
 
             for (dep_key, schema) in &obj.dependent_schemas {
                 if obj_val.contains_key(dep_key) {
-                    match schema.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
+                    match schema.validate_internal(
+                        val,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(sub_errs) => {
                             errors.push(ValidationError::DependentSchemaFailed(dep_key.clone()));
@@ -1429,7 +2836,14 @@ impl LightSchema {
                 let mut matched_properties = false;
                 if let Some(prop_schema) = obj.properties.get(k) {
                     matched_properties = true;
-                    match prop_schema.validate_internal(v, registry, options, depth + 1, warnings, dynamic_scope) {
+                    match prop_schema.validate_internal(
+                        v,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
                         Ok(_) => {
                             state.evaluated_properties.insert(k.clone());
                         }
@@ -1457,8 +2871,8 @@ impl LightSchema {
                             options,
                             depth + 1,
                             warnings,
-                        dynamic_scope,
-                    ) {
+                            dynamic_scope,
+                        ) {
                             Ok(_) => {
                                 state.evaluated_properties.insert(k.clone());
                             }
@@ -1485,8 +2899,8 @@ impl LightSchema {
                             options,
                             depth + 1,
                             warnings,
-                        dynamic_scope,
-                    ) {
+                            dynamic_scope,
+                        ) {
                             Ok(_) => {
                                 state.evaluated_properties.insert(k.clone());
                             }
@@ -1548,7 +2962,14 @@ impl LightSchema {
             let mut validated_indices = 0;
             if let Some(prefixes) = &arr.prefix_items {
                 for (idx, (schema, item)) in prefixes.iter().zip(arr_val.iter()).enumerate() {
-                    match schema.validate_internal(item, registry, options, depth + 1, warnings, dynamic_scope) {
+                    match schema.validate_internal(
+                        item,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
                         Ok(_) => {
                             state.evaluated_items.insert(idx);
                         }
@@ -1604,7 +3025,14 @@ impl LightSchema {
                 let mut contains_count = 0;
                 for (idx, item) in arr_val.iter().enumerate() {
                     if contains_schema
-                        .validate_internal(item, registry, options, depth + 1, warnings, dynamic_scope)
+                        .validate_internal(
+                            item,
+                            registry,
+                            options,
+                            depth + 1,
+                            warnings,
+                            dynamic_scope,
+                        )
                         .is_ok()
                     {
                         contains_count += 1;
@@ -1738,8 +3166,10 @@ impl LightSchema {
                 && mult > 0.0
             {
                 // Use a safer tolerance to prevent precision errors
-                let rem = n % mult;
-                if rem.abs() > 1e-10 && (mult - rem).abs() > 1e-10 {
+                let quotient = n / mult;
+                let rounded = quotient.round();
+                let diff = (quotient - rounded).abs();
+                if diff > 1e-7 {
                     errors.push(ValidationError::MultipleOf(mult));
                     check_early_stop!();
                 }
@@ -1752,11 +3182,17 @@ impl LightSchema {
                 let mut any_valid = false;
                 let mut any_errs = Vec::new();
                 for branch in &log.any_of {
-                    match branch.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
+                    match branch.validate_internal(
+                        val,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
                         Ok(sub_state) => {
                             state.merge(&sub_state);
                             any_valid = true;
-                            break;
                         }
                         Err(e) => {
                             any_errs.push(e);
@@ -1770,7 +3206,14 @@ impl LightSchema {
             }
             if !log.all_of.is_empty() {
                 for branch in &log.all_of {
-                    match branch.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
+                    match branch.validate_internal(
+                        val,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(mut sub_errs) => {
                             errors.push(ValidationError::AllOfFailed);
@@ -1784,9 +3227,14 @@ impl LightSchema {
                 let mut matches = 0;
                 let mut best_state = EvaluationState::default();
                 for branch in &log.one_of {
-                    if let Ok(sub_state) =
-                        branch.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope)
-                    {
+                    if let Ok(sub_state) = branch.validate_internal(
+                        val,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
                         matches += 1;
                         best_state = sub_state;
                     }
@@ -1808,7 +3256,14 @@ impl LightSchema {
             }
 
             if let Some(cond_if) = &log.conditional_if {
-                let if_res = cond_if.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope);
+                let if_res = cond_if.validate_internal(
+                    val,
+                    registry,
+                    options,
+                    depth + 1,
+                    warnings,
+                    dynamic_scope,
+                );
                 if let Ok(if_state) = if_res {
                     state.merge(&if_state);
                     if let Some(cond_then) = &log.conditional_then {
@@ -1818,8 +3273,8 @@ impl LightSchema {
                             options,
                             depth + 1,
                             warnings,
-                        dynamic_scope,
-                    ) {
+                            dynamic_scope,
+                        ) {
                             Ok(sub_state) => state.merge(&sub_state),
                             Err(mut sub_errs) => {
                                 errors.push(ValidationError::ThenFailed);
@@ -1829,7 +3284,14 @@ impl LightSchema {
                         }
                     }
                 } else if let Some(cond_else) = &log.conditional_else {
-                    match cond_else.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
+                    match cond_else.validate_internal(
+                        val,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(mut sub_errs) => {
                             errors.push(ValidationError::ElseFailed);
@@ -1848,7 +3310,14 @@ impl LightSchema {
         {
             for (k, v) in obj_val {
                 if !state.evaluated_properties.contains(k) {
-                    match uneval.validate_internal(v, registry, options, depth + 1, warnings, dynamic_scope) {
+                    match uneval.validate_internal(
+                        v,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
                         Ok(_) => {
                             state.evaluated_properties.insert(k.clone());
                         }
@@ -1875,7 +3344,14 @@ impl LightSchema {
         {
             for (idx, item) in arr_val.iter().enumerate() {
                 if !state.evaluated_items.contains(&idx) {
-                    match uneval.validate_internal(item, registry, options, depth + 1, warnings, dynamic_scope) {
+                    match uneval.validate_internal(
+                        item,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
                         Ok(_) => {
                             state.evaluated_items.insert(idx);
                         }

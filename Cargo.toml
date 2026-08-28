@@ -1,6 +1,6 @@
 [package]
 name = "light-json-schema"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "A strictly no_std JSON Schema validator for embedded and lightweight async systems"
 license = "MIT"
@@ -14,6 +14,7 @@ regex = { version = "1.13.1", default-features = false }
 url = { version = "2.5.8", default-features = false }
 iso8601 = { version = "0.6.1", default-features = false }
 once_cell = { version = "1.21.4", default-features = false, features = ["alloc"] }
+percent-encoding = { version = "2.3.2", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 criterion = "0.8.2"

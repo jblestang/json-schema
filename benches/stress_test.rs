@@ -27,9 +27,10 @@ fn bench_stress_test(c: &mut Criterion) {
 
     let payload_str = invalid_json.to_string();
     let bytes_len = payload_str.len();
-    
+
     let schema = LightSchema::parse(&schema_json).unwrap();
-    let options_fast = ValidationOptions { draft: light_json_schema::Draft::Draft7,
+    let options_fast = ValidationOptions {
+        draft: light_json_schema::Draft::Draft7,
         stop_on_first_error: true,
         ..Default::default()
     };
@@ -37,11 +38,15 @@ fn bench_stress_test(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(bytes_len as u64));
     group.bench_function("validate_huge_invalid", |b| {
         b.iter(|| {
-            let result = schema.validate(std::hint::black_box(&invalid_json), None, Some(options_fast.clone()));
+            let result = schema.validate(
+                std::hint::black_box(&invalid_json),
+                None,
+                Some(options_fast.clone()),
+            );
             std::hint::black_box(result);
         })
     });
-    
+
     // Now a valid case
     let mut valid_json = json!({});
     for _ in 0..100 {
@@ -53,7 +58,11 @@ fn bench_stress_test(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(valid_bytes_len as u64));
     group.bench_function("validate_huge_valid", |b| {
         b.iter(|| {
-            let result = schema.validate(std::hint::black_box(&valid_json), None, Some(options_fast.clone()));
+            let result = schema.validate(
+                std::hint::black_box(&valid_json),
+                None,
+                Some(options_fast.clone()),
+            );
             std::hint::black_box(result);
         });
     });
