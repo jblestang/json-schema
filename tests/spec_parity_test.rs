@@ -66,20 +66,6 @@ fn populate_remotes(registry: &mut SchemaRegistry) {
     }
 
     walk_dir(remotes_dir, "http://localhost:1234", registry);
-
-    let metaschema_content =
-        std::fs::read_to_string("tests/suite/remotes/draft-07-schema.json").unwrap();
-    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&metaschema_content)
-        && let Ok(schema) = light_json_schema::LightSchema::parse(&json_val) {
-            registry.schemas.insert(
-                "http://json-schema.org/draft-07/schema".to_string(),
-                schema.clone(),
-            );
-            registry.schemas.insert(
-                "http://json-schema.org/draft-07/schema#".to_string(),
-                schema,
-            );
-        }
 }
 
 #[test]
