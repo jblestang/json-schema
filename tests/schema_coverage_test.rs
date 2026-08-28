@@ -40,40 +40,35 @@ fn test_comprehensive_object_constraints() {
             .is_valid
     );
     assert!(
-        schema
+        !schema
             .validate(&json!({"a": "hi", "b": 10, "c": true}), Some(&reg), None)
             .is_valid
-            == false
     ); // > 2 props
     assert!(
-        schema
+        !schema
             .validate(&json!({"a": "hi"}), Some(&reg), None)
             .is_valid
-            == false
     ); // dependentRequired on 'a' needs 'b'
     assert!(
-        schema
+        !schema
             .validate(&json!({"A": "hi", "b": 10}), Some(&reg), None)
             .is_valid
-            == false
     ); // propertyNames
     assert!(
-        schema
+        !schema
             .validate(&json!({"a": "hi", "b": "bad"}), Some(&reg), None)
             .is_valid
-            == false
     ); // dependentSchemas
     assert!(
-        schema
+        !schema
             .validate(
                 &json!({"a": "hi", "b": 10, "c": "not_bool"}),
                 Some(&reg),
                 None
             )
             .is_valid
-            == false
     ); // additionalProperties schema
-    assert!(schema.validate(&json!({}), Some(&reg), None).is_valid == false); // minProperties
+    assert!(!schema.validate(&json!({}), Some(&reg), None).is_valid); // minProperties
 }
 
 #[test]
@@ -97,13 +92,12 @@ fn test_comprehensive_array_constraints() {
     assert!(LightSchema::parse(&bad_schema).is_err());
 
     assert!(schema.validate(&json!([1, 2, 3]), None, None).is_valid);
-    assert!(schema.validate(&json!([1, 1, 2]), None, None).is_valid == false); // uniqueItems
-    assert!(schema.validate(&json!([1]), None, None).is_valid == false); // minItems
+    assert!(!schema.validate(&json!([1, 1, 2]), None, None).is_valid); // uniqueItems
+    assert!(!schema.validate(&json!([1]), None, None).is_valid); // minItems
     assert!(
-        schema
+        !schema
             .validate(&json!([1, 2, 3, 4, 5]), None, None)
             .is_valid
-            == false
     ); // maxItems
 }
 
@@ -128,9 +122,9 @@ fn test_comprehensive_numeric_constraints() {
 
     assert!(schema.validate(&json!(10.0), None, None).is_valid);
     assert!(schema.validate(&json!(12.5), None, None).is_valid);
-    assert!(schema.validate(&json!(9.9), None, None).is_valid == false);
-    assert!(schema.validate(&json!(20.1), None, None).is_valid == false);
-    assert!(schema.validate(&json!(11.0), None, None).is_valid == false);
+    assert!(!schema.validate(&json!(9.9), None, None).is_valid);
+    assert!(!schema.validate(&json!(20.1), None, None).is_valid);
+    assert!(!schema.validate(&json!(11.0), None, None).is_valid);
 }
 
 #[test]
@@ -152,8 +146,8 @@ fn test_exclusive_numeric_constraints() {
     assert!(LightSchema::parse(&bad_schema).is_err());
 
     assert!(schema.validate(&json!(15.0), None, None).is_valid);
-    assert!(schema.validate(&json!(10.0), None, None).is_valid == false);
-    assert!(schema.validate(&json!(20.0), None, None).is_valid == false);
+    assert!(!schema.validate(&json!(10.0), None, None).is_valid);
+    assert!(!schema.validate(&json!(20.0), None, None).is_valid);
 }
 
 #[test]
@@ -176,9 +170,9 @@ fn test_comprehensive_string_constraints() {
     assert!(LightSchema::parse(&bad_schema).is_err());
 
     assert!(schema.validate(&json!("a_b"), None, None).is_valid);
-    assert!(schema.validate(&json!("ab"), None, None).is_valid == false);
-    assert!(schema.validate(&json!("a_123_b"), None, None).is_valid == false);
-    assert!(schema.validate(&json!("c_d"), None, None).is_valid == false);
+    assert!(!schema.validate(&json!("ab"), None, None).is_valid);
+    assert!(!schema.validate(&json!("a_123_b"), None, None).is_valid);
+    assert!(!schema.validate(&json!("c_d"), None, None).is_valid);
 }
 
 #[test]
@@ -217,7 +211,7 @@ fn test_formats() {
 
         assert!(schema.validate(&json!(valids[i]), None, None).is_valid);
         assert!(
-            schema
+            !schema
                 .validate(
                     &json!(invalids[i]),
                     None,
@@ -227,7 +221,6 @@ fn test_formats() {
                     })
                 )
                 .is_valid
-                == false
         );
     }
 }
@@ -252,10 +245,10 @@ fn test_logic() {
 
     assert!(schema.validate(&json!(15), None, None).is_valid);
     assert!(schema.validate(&json!(2), None, None).is_valid);
-    assert!(schema.validate(&json!(7), None, None).is_valid == false); // neither oneOf
-    assert!(schema.validate(&json!("test"), None, None).is_valid == false); // fails oneOf (not number so min/max doesn't apply? Wait, if type is not specified, minimum doesn't fail on strings! Ah. In draft 7, minimum ignores strings. So strings pass both branches of oneOf => 2 matches => fails oneOf)
+    assert!(!schema.validate(&json!(7), None, None).is_valid); // neither oneOf
+    assert!(!schema.validate(&json!("test"), None, None).is_valid); // fails oneOf (not number so min/max doesn't apply? Wait, if type is not specified, minimum doesn't fail on strings! Ah. In draft 7, minimum ignores strings. So strings pass both branches of oneOf => 2 matches => fails oneOf)
 
-    assert!(schema.validate(&json!(true), None, None).is_valid == false); // fails allOf
+    assert!(!schema.validate(&json!(true), None, None).is_valid); // fails allOf
 }
 
 #[test]
@@ -277,9 +270,9 @@ fn test_conditionals() {
     assert!(LightSchema::parse(&bad_schema).is_err());
 
     assert!(schema.validate(&json!(15), None, None).is_valid);
-    assert!(schema.validate(&json!(5), None, None).is_valid == false);
+    assert!(!schema.validate(&json!(5), None, None).is_valid);
     assert!(schema.validate(&json!("hi"), None, None).is_valid);
-    assert!(schema.validate(&json!(true), None, None).is_valid == false);
+    assert!(!schema.validate(&json!(true), None, None).is_valid);
 }
 
 #[test]
@@ -305,12 +298,11 @@ fn test_references() {
 
     assert!(schema.validate(&json!(10), Some(&registry), None).is_valid);
     assert!(
-        schema
+        !schema
             .validate(&json!("hi"), Some(&registry), None)
             .is_valid
-            == false
     );
-    assert!(schema.validate(&json!(10), None, None).is_valid == false); // missing registry
+    assert!(!schema.validate(&json!(10), None, None).is_valid); // missing registry
 }
 
 #[test]
@@ -331,7 +323,7 @@ fn test_enum_const() {
     assert!(LightSchema::parse(&bad_schema).is_err());
 
     assert!(schema.validate(&json!(1), None, None).is_valid);
-    assert!(schema.validate(&json!("a"), None, None).is_valid == false); // fails const
+    assert!(!schema.validate(&json!("a"), None, None).is_valid); // fails const
 }
 
 #[test]
@@ -340,7 +332,7 @@ fn test_booleans() {
     assert!(schema.validate(&json!(1), None, None).is_valid);
 
     let schema = LightSchema::parse(&json!(false)).unwrap();
-    assert!(schema.validate(&json!(1), None, None).is_valid == false);
+    assert!(!schema.validate(&json!(1), None, None).is_valid);
 }
 
 #[test]
@@ -385,7 +377,7 @@ fn test_metadata_and_edge_cases() {
     assert!(LightSchema::parse(&bad_schema).is_err());
 
     assert!(schema.validate(&json!([1]), None, None).is_valid);
-    assert!(schema.validate(&json!([1, 2]), None, None).is_valid == false); // > 1
+    assert!(!schema.validate(&json!([1, 2]), None, None).is_valid); // > 1
 
     // exclusiveMaximum
     let schema_json = json!({
@@ -403,7 +395,7 @@ fn test_metadata_and_edge_cases() {
     assert!(LightSchema::parse(&bad_schema).is_err());
 
     assert!(schema.validate(&json!(9.9), None, None).is_valid);
-    assert!(schema.validate(&json!(10.0), None, None).is_valid == false);
+    assert!(!schema.validate(&json!(10.0), None, None).is_valid);
 
     // pattern missing match
     let schema_json = json!({
@@ -421,7 +413,7 @@ fn test_metadata_and_edge_cases() {
     assert!(LightSchema::parse(&bad_schema).is_err());
 
     assert!(schema.validate(&json!("abc"), None, None).is_valid);
-    assert!(schema.validate(&json!("123"), None, None).is_valid == false);
+    assert!(!schema.validate(&json!("123"), None, None).is_valid);
 
     // array type check
     let schema_json = json!({ "type": "array" });
@@ -436,7 +428,7 @@ fn test_metadata_and_edge_cases() {
     });
     assert!(LightSchema::parse(&bad_schema).is_err());
 
-    assert!(schema.validate(&json!("not_array"), None, None).is_valid == false);
+    assert!(!schema.validate(&json!("not_array"), None, None).is_valid);
 
     // null type check
     let schema_json = json!({ "type": "null" });
@@ -452,7 +444,7 @@ fn test_metadata_and_edge_cases() {
     assert!(LightSchema::parse(&bad_schema).is_err());
 
     assert!(schema.validate(&json!(null), None, None).is_valid);
-    assert!(schema.validate(&json!(1), None, None).is_valid == false);
+    assert!(!schema.validate(&json!(1), None, None).is_valid);
 }
 
 #[test]
@@ -489,7 +481,7 @@ fn test_validation_error_display() {
     });
 
     let result = schema.validate(&data, None, None);
-    assert!(result.is_valid == false);
+    assert!(!result.is_valid);
 
     let errs = result.errors;
     let display = format!("{}", errs[1]);
@@ -522,6 +514,7 @@ fn test_stop_on_first_error() {
     assert_eq!(result_all.errors.len(), 2);
 
     let options = ValidationOptions {
+        draft: light_json_schema::Draft::Draft7,
         stop_on_first_error: true,
         max_depth: 16,
         format_assertions: false,
@@ -552,7 +545,7 @@ fn test_unevaluated_items_failure() {
 
     // First is evaluated by items, second is evaluated by unevaluatedItems (which fails because it's a string)
     let data = json!(["hello", "world"]);
-    assert!(schema.validate(&data, None, None).is_valid == false);
+    assert!(!schema.validate(&data, None, None).is_valid);
 
     let data2 = json!(["hello", 123]);
     assert!(schema.validate(&data2, None, None).is_valid);
@@ -580,7 +573,7 @@ fn test_unevaluated_properties_failure() {
 
     // b fails because unevaluated properties must be integers
     let data = json!({ "a": "hello", "b": "world" });
-    assert!(schema.validate(&data, None, None).is_valid == false);
+    assert!(!schema.validate(&data, None, None).is_valid);
 
     let data2 = json!({ "a": "hello", "b": 123 });
     assert!(schema.validate(&data2, None, None).is_valid);
@@ -620,19 +613,19 @@ fn test_complex_coverage() {
 
     // Test patternProperties failure (string instead of integer)
     let data1 = json!({ "123": "not_an_integer" });
-    assert!(schema.validate(&data1, None, None).is_valid == false);
+    assert!(!schema.validate(&data1, None, None).is_valid);
 
     // Test additionalProperties failure (string instead of boolean)
     let data2 = json!({ "abc": "not_a_boolean" });
-    assert!(schema.validate(&data2, None, None).is_valid == false);
+    assert!(!schema.validate(&data2, None, None).is_valid);
 
     // Test prefixItems failure
     let data3 = json!({ "arr": [ 123 ] }); // 123 is integer, but prefix item 0 is string
-    assert!(schema.validate(&data3, None, None).is_valid == false);
+    assert!(!schema.validate(&data3, None, None).is_valid);
 
     // Test contains failure
     let data4 = json!({ "arr": [ "hi", "there" ] }); // no integers inside
-    assert!(schema.validate(&data4, None, None).is_valid == false);
+    assert!(!schema.validate(&data4, None, None).is_valid);
 }
 
 #[test]
@@ -645,7 +638,9 @@ fn test_max_depth_exceeded() {
         }
     });
     let mut registry = SchemaRegistry::new();
-    registry.add("self", &schema_json.to_string()).unwrap();
+    registry
+        .add("json-schema://root/self", &schema_json.to_string())
+        .unwrap();
     let schema = LightSchema::parse(&schema_json).unwrap();
 
     // Default max depth is 16. A deeply nested json should hit it.

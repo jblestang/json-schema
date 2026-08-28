@@ -1,9 +1,9 @@
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use light_json_schema::{LightSchema, ValidationOptions};
 use serde_json::json;
 
 fn bench_stress_test(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Validation Stress Test");
+    let mut group = c.benchmark_group("light-json-schema-stress");
 
     // A small JSON schema with constraints
     let schema_json = json!({
@@ -17,8 +17,6 @@ fn bench_stress_test(c: &mut Criterion) {
         "required": ["name", "age", "email"]
     });
 
-    let schema = LightSchema::parse(&schema_json).unwrap();
-
     let invalid_json = json!({
         "name": "InvalidNameIsTooLong",
         "age": "25",
@@ -28,37 +26,35 @@ fn bench_stress_test(c: &mut Criterion) {
     });
 
     let payload_str = invalid_json.to_string();
-    let bytes_len = payload_str.as_bytes().len();
-    group.throughput(Throughput::Bytes(bytes_len as u64));
-
-    // Measure with fast fail
-    let options_fast = ValidationOptions {
-        format_assertions: true,
-        max_depth: 32,
+    let bytes_len = payload_str.len();
+    
+    let schema = LightSchema::parse(&schema_json).unwrap();
+    let options_fast = ValidationOptions { draft: light_json_schema::Draft::Draft7,
         stop_on_first_error: true,
+        ..Default::default()
     };
 
-    group.bench_function("validate_small_json_errors_fast_fail", |b| {
+    group.throughput(Throughput::Bytes(bytes_len as u64));
+    group.bench_function("validate_huge_invalid", |b| {
         b.iter(|| {
-            let result =
-                schema.validate(black_box(&invalid_json), None, Some(options_fast.clone()));
-            black_box(result);
+            let result = schema.validate(std::hint::black_box(&invalid_json), None, Some(options_fast.clone()));
+            std::hint::black_box(result);
+        })
+    });
+    
+    // Now a valid case
+    let mut valid_json = json!({});
+    for _ in 0..100 {
+        valid_json = json!({
+            "a": valid_json
         });
-    });
-
-    // Valid JSON benchmark to see maximum potential throughput
-    let valid_json = json!({
-        "name": "valid",
-        "age": 25,
-        "email": "test@example.com",
-        "tags": ["rust", "json"]
-    });
-    let valid_bytes_len = valid_json.to_string().as_bytes().len();
+    }
+    let valid_bytes_len = valid_json.to_string().len();
     group.throughput(Throughput::Bytes(valid_bytes_len as u64));
-    group.bench_function("validate_small_json_valid", |b| {
+    group.bench_function("validate_huge_valid", |b| {
         b.iter(|| {
-            let result = schema.validate(black_box(&valid_json), None, Some(options_fast.clone()));
-            black_box(result);
+            let result = schema.validate(std::hint::black_box(&valid_json), None, Some(options_fast.clone()));
+            std::hint::black_box(result);
         });
     });
 

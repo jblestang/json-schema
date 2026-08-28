@@ -15,12 +15,12 @@ fn test_comparison_with_jsonschema() {
     });
 
     let light_validator = LightSchema::parse(&schema_json).expect("Invalid light-json-schema");
-    
+
     // In `jsonschema` crate, draft 7 format validation is disabled by default.
     // We can enable it via options, but it's simpler to just match its default behavior
     // by turning off format_assertions in light_validator too.
     let jsonschema_validator = jsonschema::validator_for(&schema_json).unwrap();
-    
+
     let options = ValidationOptions {
         format_assertions: false,
         ..Default::default()
@@ -34,14 +34,14 @@ fn test_comparison_with_jsonschema() {
                 "age": 30,
                 "email": "alice@example.com",
                 "tags": ["rust", "json"]
-            })
+            }),
         ),
         (
             "Missing required",
             json!({
                 "name": "alice",
                 "email": "alice@example.com"
-            })
+            }),
         ),
         (
             "Invalid type",
@@ -49,7 +49,7 @@ fn test_comparison_with_jsonschema() {
                 "name": "alice",
                 "age": "30",
                 "email": "alice@example.com"
-            })
+            }),
         ),
         (
             "Invalid length",
@@ -57,7 +57,7 @@ fn test_comparison_with_jsonschema() {
                 "name": "a",
                 "age": 30,
                 "email": "alice@example.com"
-            })
+            }),
         ),
         (
             "Invalid pattern",
@@ -65,7 +65,7 @@ fn test_comparison_with_jsonschema() {
                 "name": "Alice",
                 "age": 30,
                 "email": "alice@example.com"
-            })
+            }),
         ),
         (
             "Invalid format (should pass when format_assertions=false)",
@@ -73,7 +73,7 @@ fn test_comparison_with_jsonschema() {
                 "name": "alice",
                 "age": 30,
                 "email": "not-an-email"
-            })
+            }),
         ),
         (
             "Invalid array",
@@ -82,7 +82,7 @@ fn test_comparison_with_jsonschema() {
                 "age": 30,
                 "email": "alice@example.com",
                 "tags": ["a", "b", "c", "d", "e", "f"]
-            })
+            }),
         ),
         (
             "Invalid array item type",
@@ -91,14 +91,16 @@ fn test_comparison_with_jsonschema() {
                 "age": 30,
                 "email": "alice@example.com",
                 "tags": ["a", 2]
-            })
-        )
+            }),
+        ),
     ];
 
     for (name, payload) in test_cases {
         let is_valid_jsonschema = jsonschema_validator.is_valid(&payload);
-        let is_valid_light = light_validator.validate(&payload, None, Some(options.clone())).is_valid;
-        
+        let is_valid_light = light_validator
+            .validate(&payload, None, Some(options.clone()))
+            .is_valid;
+
         assert_eq!(
             is_valid_jsonschema, is_valid_light,
             "Mismatch on test case '{}'. jsonschema: {}, light-json-schema: {}",
@@ -114,8 +116,8 @@ fn inspect_error() {
     let compiled = jsonschema::validator_for(&schema_json).unwrap();
     let result = compiled.validate(&instance);
     if let Err(errors) = result {
-        for e in errors {
-            println!("{:?}", e);
-        }
+        let _errors = errors;
+        //    println!("{:?}", e);
+        // }
     }
 }

@@ -14,11 +14,31 @@ use core::str::FromStr;
 use url::Url;
 
 /// Options to configure the validation behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Draft {
+    Draft7,
+    Draft2019_09,
+    Draft2020_12,
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidationOptions {
     pub stop_on_first_error: bool,
     pub max_depth: usize,
     pub format_assertions: bool,
+    pub draft: Draft,
+}
+
+impl ValidationOptions {
+    pub fn with_format_assertions(mut self, assert: bool) -> Self {
+        self.format_assertions = assert;
+        self
+    }
+
+    pub fn with_draft(mut self, draft: Draft) -> Self {
+        self.draft = draft;
+        self
+    }
 }
 
 impl Default for ValidationOptions {
@@ -27,6 +47,7 @@ impl Default for ValidationOptions {
             stop_on_first_error: false,
             max_depth: 16,
             format_assertions: false,
+            draft: Draft::Draft2020_12,
         }
     }
 }
@@ -66,7 +87,7 @@ impl EvaluationState {
 /// Because `light-json-schema` is designed for `#![no_std]` environments, it
 /// cannot perform network HTTP requests or read from the filesystem to resolve
 /// remote schemas. Instead, you must pre-load remote schemas into this registry.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SchemaRegistry {
     pub schemas: BTreeMap<String, LightSchema>,
 }
@@ -113,21 +134,26 @@ pub enum SchemaFormat {
     Uri,
     Email(regex::Regex),
     DateTime,
+    Unknown(String),
 }
 
 #[derive(Debug, Clone)]
 pub enum SchemaParseError {
     InvalidRegex(String),
     UnknownFormat(String),
+    InvalidSchema(alloc::vec::Vec<crate::ValidationError>),
 }
 
 impl core::fmt::Display for SchemaParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SchemaParseError::InvalidRegex(e) => write!(f, "Invalid regular expression: {}", e),
-            SchemaParseError::UnknownFormat(f_name) => {
-                write!(f, "Unknown format string: {}", f_name)
-            }
+            SchemaParseError::UnknownFormat(f_str) => write!(f, "Unknown format: {}", f_str),
+            SchemaParseError::InvalidSchema(errs) => write!(
+                f,
+                "Schema failed to validate against metaschema: {:?}",
+                errs
+            ),
         }
     }
 }
@@ -178,7 +204,7 @@ pub enum ValidationError {
     MultipleOf(f64),
 
     // Logic
-    AnyOfFailed,
+    AnyOfFailed(alloc::vec::Vec<alloc::vec::Vec<ValidationError>>),
     AllOfFailed,
     OneOfMatches(usize),
     NotFailed,
@@ -317,6 +343,7 @@ pub struct LightSchema {
     /// Points to an external or internal schema identifier for `$ref` resolution.
     pub reference: Option<String>,
     pub dynamic_reference: Option<String>,
+    pub dynamic_anchor: Option<String>,
     /// Specifies semantic validation (e.g. `ipv4`, `email`, `date-time`).
     pub format: Option<SchemaFormat>,
 
@@ -337,14 +364,65 @@ pub struct LightSchema {
 
 fn parse_u64(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| {
-        v.as_f64().filter(|&f| f.fract() == 0.0 && f >= 0.0).map(|f| f as u64)
+        v.as_f64()
+            .filter(|&f| (f as i64) as f64 == f && f >= 0.0)
+            .map(|f| f as u64)
     })
 }
 
 impl LightSchema {
     /// Parses a raw `serde_json::Value` into a strongly-typed `LightSchema`.
-    /// This method recursively parses subschemas.
     pub fn parse(val: &Value) -> Result<Self, SchemaParseError> {
+        let mut registry = SchemaRegistry::new();
+        let base_uri = url::Url::parse("json-schema://root/").unwrap();
+        Self::parse_with_context(val, &mut registry, &base_uri, "")
+    }
+
+    pub fn parse_with_context(
+        val: &Value,
+        registry: &mut SchemaRegistry,
+        base_uri: &url::Url,
+        pointer: &str,
+    ) -> Result<Self, SchemaParseError> {
+        let mut current_base = base_uri.clone();
+        let mut new_pointer = pointer.to_string();
+
+        if let Some(id_str) = val.get("$id").and_then(|v| v.as_str())
+            && let Ok(joined) = base_uri.join(id_str)
+                && !id_str.starts_with('#') {
+                    current_base = joined;
+                    new_pointer = String::new();
+                }
+
+        if let Some(defs) = val.get("$defs").and_then(|p| p.as_object()) {
+            for (k, v) in defs {
+                let _ = LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!(
+                        "{}/$defs/{}",
+                        new_pointer,
+                        k.replace("~", "~0").replace("/", "~1")
+                    ),
+                );
+            }
+        }
+        if let Some(defs) = val.get("definitions").and_then(|p| p.as_object()) {
+            for (k, v) in defs {
+                let _ = LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!(
+                        "{}/definitions/{}",
+                        new_pointer,
+                        k.replace("~", "~0").replace("/", "~1")
+                    ),
+                );
+            }
+        }
+
         // 1. Check for boolean schema (true = any, false = not any)
         if let Some(b) = val.as_bool() {
             let mut schema = Self::empty();
@@ -402,9 +480,13 @@ impl LightSchema {
         let reference = val
             .get("$ref")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(|s| current_base.join(s).unwrap().to_string());
         let dynamic_reference = val
             .get("$dynamicRef")
+            .and_then(|v| v.as_str())
+            .map(|s| current_base.join(s).unwrap().to_string());
+        let dynamic_anchor = val
+            .get("$dynamicAnchor")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let format = match val.get("format").and_then(|v| v.as_str()) {
@@ -415,7 +497,7 @@ impl LightSchema {
                 regex::Regex::new(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$").unwrap(),
             )),
             Some("date-time") => Some(SchemaFormat::DateTime),
-            Some(s) => return Err(SchemaParseError::UnknownFormat(s.to_string())),
+            Some(s) => Some(SchemaFormat::Unknown(s.to_string())),
             None => None,
         };
 
@@ -440,7 +522,19 @@ impl LightSchema {
         if let Some(props) = val.get("properties").and_then(|p| p.as_object()) {
             has_obj = true;
             for (k, v) in props {
-                properties.insert(k.clone(), LightSchema::parse(v)?);
+                properties.insert(
+                    k.clone(),
+                    LightSchema::parse_with_context(
+                        v,
+                        registry,
+                        &current_base,
+                        &format!(
+                            "{}/properties/{}",
+                            new_pointer,
+                            k.replace("~", "~0").replace("/", "~1")
+                        ),
+                    )?,
+                );
             }
         }
 
@@ -474,7 +568,48 @@ impl LightSchema {
         if let Some(deps) = val.get("dependentSchemas").and_then(|p| p.as_object()) {
             has_obj = true;
             for (k, v) in deps {
-                dependent_schemas.insert(k.clone(), Box::new(LightSchema::parse(v)?));
+                dependent_schemas.insert(
+                    k.clone(),
+                    Box::new(LightSchema::parse_with_context(
+                        v,
+                        registry,
+                        &current_base,
+                        &format!(
+                            "{}/dependentSchemas/{}",
+                            new_pointer,
+                            k.replace("~", "~0").replace("/", "~1")
+                        ),
+                    )?),
+                );
+            }
+        }
+
+        if let Some(deps) = val.get("dependencies").and_then(|p| p.as_object()) {
+            has_obj = true;
+            for (k, v) in deps {
+                if let Some(arr) = v.as_array() {
+                    let mut req_list = Vec::new();
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            req_list.push(s.to_string());
+                        }
+                    }
+                    dependent_required.insert(k.clone(), req_list);
+                } else {
+                    dependent_schemas.insert(
+                        k.clone(),
+                        Box::new(LightSchema::parse_with_context(
+                            v,
+                            registry,
+                            &current_base,
+                            &format!(
+                                "{}/dependencies/{}",
+                                new_pointer,
+                                k.replace("~", "~0").replace("/", "~1")
+                            ),
+                        )?),
+                    );
+                }
             }
         }
 
@@ -484,21 +619,43 @@ impl LightSchema {
             for (k, v) in props {
                 let reg = regex::Regex::new(k)
                     .map_err(|e| SchemaParseError::InvalidRegex(e.to_string()))?;
-                pattern_properties.push((reg, LightSchema::parse(v)?));
+                pattern_properties.push((
+                    reg,
+                    LightSchema::parse_with_context(
+                        v,
+                        registry,
+                        &current_base,
+                        &format!(
+                            "{}/patternProperties/{}",
+                            new_pointer,
+                            k.replace("~", "~0").replace("/", "~1")
+                        ),
+                    )?,
+                ));
             }
         }
 
         let property_names = match val.get("propertyNames") {
             Some(v) => {
                 has_obj = true;
-                Some(Box::new(LightSchema::parse(v)?))
+                Some(Box::new(LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!("{}/propertyNames", new_pointer),
+                )?))
             }
             None => None,
         };
         let unevaluated_properties = match val.get("unevaluatedProperties") {
             Some(v) => {
                 has_obj = true;
-                Some(Box::new(LightSchema::parse(v)?))
+                Some(Box::new(LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!("{}/unevaluatedProperties", new_pointer),
+                )?))
             }
             None => None,
         };
@@ -511,7 +668,12 @@ impl LightSchema {
             if let Some(b) = ap.as_bool() {
                 additional_properties_allowed = Some(b);
             } else if ap.is_object() {
-                additional_properties_schema = Some(Box::new(LightSchema::parse(ap)?));
+                additional_properties_schema = Some(Box::new(LightSchema::parse_with_context(
+                    ap,
+                    registry,
+                    &current_base,
+                    &format!("{}/additionalProperties", new_pointer),
+                )?));
             }
         }
 
@@ -554,30 +716,47 @@ impl LightSchema {
                 // Draft 07 arrays
                 let mut prefix = Vec::new();
                 for item in arr_it {
-                    prefix.push(LightSchema::parse(item)?);
+                    prefix.push(LightSchema::parse_with_context(
+                        item,
+                        registry,
+                        &current_base,
+                        &format!("{}/items/{}", new_pointer, prefix.len()),
+                    )?);
                 }
                 prefix_items = Some(prefix);
+                if let Some(add_it) = val.get("additionalItems") {
+                    items = Some(Box::new(LightSchema::parse_with_context(
+                        add_it,
+                        registry,
+                        &current_base,
+                        &format!("{}/additionalItems", new_pointer),
+                    )?));
+                }
             } else {
-                items = Some(Box::new(LightSchema::parse(it)?));
+                items = Some(Box::new(LightSchema::parse_with_context(
+                    it,
+                    registry,
+                    &current_base,
+                    &format!("{}/items", new_pointer),
+                )?));
             }
         }
         if let Some(pre) = val.get("prefixItems").and_then(|a| a.as_array()) {
             has_arr = true;
             let mut prefix = Vec::new();
             for item in pre {
-                prefix.push(LightSchema::parse(item)?);
+                prefix.push(LightSchema::parse_with_context(
+                    item,
+                    registry,
+                    &current_base,
+                    &format!("{}/items/{}", new_pointer, prefix.len()),
+                )?);
             }
             prefix_items = Some(prefix);
         }
 
-        let min_items = val
-            .get("minItems")
-            .and_then(parse_u64)
-            .map(|v| v as usize);
-        let max_items = val
-            .get("maxItems")
-            .and_then(parse_u64)
-            .map(|v| v as usize);
+        let min_items = val.get("minItems").and_then(parse_u64).map(|v| v as usize);
+        let max_items = val.get("maxItems").and_then(parse_u64).map(|v| v as usize);
         let unique_items = val.get("uniqueItems").and_then(|v| v.as_bool());
         if min_items.is_some() || max_items.is_some() || unique_items.is_some() {
             has_arr = true;
@@ -586,7 +765,12 @@ impl LightSchema {
         let unevaluated_items = match val.get("unevaluatedItems") {
             Some(v) => {
                 has_arr = true;
-                Some(Box::new(LightSchema::parse(v)?))
+                Some(Box::new(LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!("{}/contains", new_pointer),
+                )?))
             }
             None => None,
         };
@@ -594,7 +778,12 @@ impl LightSchema {
         let contains = match val.get("contains") {
             Some(v) => {
                 has_arr = true;
-                Some(Box::new(LightSchema::parse(v)?))
+                Some(Box::new(LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!("{}/contains", new_pointer),
+                )?))
             }
             None => None,
         };
@@ -646,14 +835,8 @@ impl LightSchema {
             None
         };
 
-        let min_length = val
-            .get("minLength")
-            .and_then(parse_u64)
-            .map(|v| v as usize);
-        let max_length = val
-            .get("maxLength")
-            .and_then(parse_u64)
-            .map(|v| v as usize);
+        let min_length = val.get("minLength").and_then(parse_u64).map(|v| v as usize);
+        let max_length = val.get("maxLength").and_then(parse_u64).map(|v| v as usize);
         let mut pattern = None;
         if let Some(p) = val.get("pattern").and_then(|v| v.as_str()) {
             pattern = Some(
@@ -675,28 +858,48 @@ impl LightSchema {
         if let Some(any) = val.get("anyOf").and_then(|a| a.as_array()) {
             has_log = true;
             for item in any {
-                any_of.push(LightSchema::parse(item)?);
+                any_of.push(LightSchema::parse_with_context(
+                    item,
+                    registry,
+                    &current_base,
+                    &format!("{}/anyOf/{}", new_pointer, any_of.len()),
+                )?);
             }
         }
         let mut all_of = Vec::new();
         if let Some(all) = val.get("allOf").and_then(|a| a.as_array()) {
             has_log = true;
             for item in all {
-                all_of.push(LightSchema::parse(item)?);
+                all_of.push(LightSchema::parse_with_context(
+                    item,
+                    registry,
+                    &current_base,
+                    &format!("{}/allOf/{}", new_pointer, all_of.len()),
+                )?);
             }
         }
         let mut one_of = Vec::new();
         if let Some(one) = val.get("oneOf").and_then(|a| a.as_array()) {
             has_log = true;
             for item in one {
-                one_of.push(LightSchema::parse(item)?);
+                one_of.push(LightSchema::parse_with_context(
+                    item,
+                    registry,
+                    &current_base,
+                    &format!("{}/oneOf/{}", new_pointer, one_of.len()),
+                )?);
             }
         }
 
         let not = match val.get("not") {
             Some(v) => {
                 has_log = true;
-                Some(Box::new(LightSchema::parse(v)?))
+                Some(Box::new(LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!("{}/contains", new_pointer),
+                )?))
             }
             None => None,
         };
@@ -704,21 +907,36 @@ impl LightSchema {
         let conditional_if = match val.get("if") {
             Some(v) => {
                 has_log = true;
-                Some(Box::new(LightSchema::parse(v)?))
+                Some(Box::new(LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!("{}/contains", new_pointer),
+                )?))
             }
             None => None,
         };
         let conditional_then = match val.get("then") {
             Some(v) => {
                 has_log = true;
-                Some(Box::new(LightSchema::parse(v)?))
+                Some(Box::new(LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!("{}/contains", new_pointer),
+                )?))
             }
             None => None,
         };
         let conditional_else = match val.get("else") {
             Some(v) => {
                 has_log = true;
-                Some(Box::new(LightSchema::parse(v)?))
+                Some(Box::new(LightSchema::parse_with_context(
+                    v,
+                    registry,
+                    &current_base,
+                    &format!("{}/contains", new_pointer),
+                )?))
             }
             None => None,
         };
@@ -737,9 +955,10 @@ impl LightSchema {
             None
         };
 
-        Ok(Self {
+        let schema = Self {
             types,
             dynamic_reference,
+            dynamic_anchor: dynamic_anchor.clone(),
             reference,
             format,
             title,
@@ -753,14 +972,112 @@ impl LightSchema {
             num: num_constraints,
             str: str_constraints,
             log: log_constraints,
-        })
+        };
+
+        let uri = if new_pointer.is_empty() {
+            current_base.to_string()
+        } else {
+            let mut u = current_base.clone();
+            u.set_fragment(Some(&new_pointer));
+            u.to_string()
+        };
+        registry.schemas.insert(uri, schema.clone());
+
+        if let Some(anchor) = val.get("$anchor").and_then(|v| v.as_str()) {
+            let mut u = current_base.clone();
+            u.set_fragment(Some(anchor));
+            registry.schemas.insert(u.to_string(), schema.clone());
+        }
+        if let Some(anchor) = &dynamic_anchor {
+            let mut u = current_base.clone();
+            u.set_fragment(Some(anchor));
+            registry.schemas.insert(u.to_string(), schema.clone());
+        }
+
+        Ok(schema)
     }
 
     /// Creates an empty schema that validates anything.
+    pub fn values_equal(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Number(na), Value::Number(nb)) => {
+                if na.is_f64() && nb.is_f64() {
+                    na.as_f64() == nb.as_f64()
+                } else if na.is_u64() && nb.is_u64() {
+                    na.as_u64() == nb.as_u64()
+                } else if na.is_i64() && nb.is_i64() {
+                    na.as_i64() == nb.as_i64()
+                } else if let (Some(fa), Some(fb)) = (na.as_f64(), nb.as_f64()) {
+                    fa == fb
+                } else {
+                    false
+                }
+            }
+            (Value::Array(aa), Value::Array(ab)) => {
+                if aa.len() != ab.len() {
+                    false
+                } else {
+                    aa.iter()
+                        .zip(ab.iter())
+                        .all(|(x, y)| Self::values_equal(x, y))
+                }
+            }
+            (Value::Object(oa), Value::Object(ob)) => {
+                if oa.len() != ob.len() {
+                    false
+                } else {
+                    oa.iter()
+                        .all(|(k, v)| ob.get(k).is_some_and(|ov| Self::values_equal(v, ov)))
+                }
+            }
+            _ => a == b,
+        }
+    }
+
+    pub fn parse_strict(val: &Value) -> Result<Self, SchemaParseError> {
+        static METASCHEMA_REGISTRY: once_cell::race::OnceBox<SchemaRegistry> =
+            once_cell::race::OnceBox::new();
+            
+        let registry = METASCHEMA_REGISTRY.get_or_init(|| {
+            let meta_json = include_str!("metaschemas.json");
+            let schemas_map: alloc::collections::BTreeMap<String, Value> = 
+                serde_json::from_str(meta_json).expect("Invalid metaschemas JSON");
+
+            let mut reg = SchemaRegistry::new();
+            for (uri, schema_val) in schemas_map {
+                let base_uri = url::Url::parse(&uri).unwrap();
+                // Parse and add to registry
+                if let Ok(schema) = LightSchema::parse_with_context(&schema_val, &mut reg, &base_uri, "") {
+                    reg.schemas.insert(uri.to_string(), schema);
+                }
+            }
+            alloc::boxed::Box::new(reg)
+        });
+
+        // Determine which metaschema to validate against
+        let schema_uri = val.get("$schema")
+            .and_then(|s| s.as_str())
+            .unwrap_or("https://json-schema.org/draft/2020-12/schema");
+            
+        // Clean URI (remove # if present at the end)
+        let schema_uri = schema_uri.trim_end_matches('#');
+        
+        let metaschema = registry.schemas.get(schema_uri)
+            .or_else(|| registry.schemas.get("https://json-schema.org/draft/2020-12/schema"))
+            .expect("Default metaschema missing");
+
+        let result = metaschema.validate(val, Some(registry), None);
+        if !result.is_valid {
+            return Err(SchemaParseError::InvalidSchema(result.errors));
+        }
+        Self::parse(val)
+    }
+
     pub fn empty() -> Self {
         Self {
             types: alloc::vec![SchemaType::Any],
             dynamic_reference: None,
+            dynamic_anchor: None,
             reference: None,
             format: None,
             title: None,
@@ -791,7 +1108,8 @@ impl LightSchema {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
         let opts = options.unwrap_or_default();
-        match self.validate_internal(val, registry, &opts, 0, &mut warnings) {
+        let mut dynamic_scope = Vec::new();
+        match self.validate_internal(val, registry, &opts, 0, &mut warnings, &mut dynamic_scope) {
             Ok(_) => ValidationOutput {
                 is_valid: true,
                 errors: alloc::vec![],
@@ -808,13 +1126,38 @@ impl LightSchema {
         }
     }
 
-    pub fn validate_internal(
-        &self,
+    pub fn validate_internal<'a>(
+        &'a self,
         val: &Value,
-        registry: Option<&SchemaRegistry>,
+        registry: Option<&'a SchemaRegistry>,
         options: &ValidationOptions,
         depth: usize,
         warnings: &mut Vec<ValidationError>,
+        dynamic_scope: &mut Vec<(&'a str, &'a LightSchema)>,
+    ) -> Result<EvaluationState, Vec<ValidationError>> {
+        let pushed = if let Some(anchor) = &self.dynamic_anchor {
+            dynamic_scope.push((anchor.as_str(), self));
+            true
+        } else {
+            false
+        };
+        
+        let res = self.validate_internal_impl(val, registry, options, depth, warnings, dynamic_scope);
+        
+        if pushed {
+            dynamic_scope.pop();
+        }
+        res
+    }
+
+    fn validate_internal_impl<'a>(
+        &'a self,
+        val: &Value,
+        registry: Option<&'a SchemaRegistry>,
+        options: &ValidationOptions,
+        depth: usize,
+        warnings: &mut Vec<ValidationError>,
+        dynamic_scope: &mut Vec<(&'a str, &'a LightSchema)>,
     ) -> Result<EvaluationState, Vec<ValidationError>> {
         let stop_on_first_error = options.stop_on_first_error;
         let mut errors = Vec::new();
@@ -837,7 +1180,7 @@ impl LightSchema {
         if let Some(r) = &self.dynamic_reference {
             if let Some(reg) = registry {
                 if let Some(resolved) = reg.schemas.get(r) {
-                    match resolved.validate_internal(val, registry, options, depth + 1, warnings) {
+                    match resolved.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(sub_errs) => {
                             errors.extend(sub_errs);
@@ -863,6 +1206,7 @@ impl LightSchema {
                         options,
                         depth + 1,
                         warnings,
+                        dynamic_scope,
                     ) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(mut sub_errs) => {
@@ -879,21 +1223,65 @@ impl LightSchema {
                 errors.push(ValidationError::UnresolvedReference(ref_str.clone()));
                 check_early_stop!();
             }
+
+            if options.draft == Draft::Draft7 {
+                if errors.is_empty() {
+                    return Ok(state);
+                } else {
+                    return Err(errors);
+                }
+            }
+        }
+
+
+        if let Some(dref_str) = &self.dynamic_reference {
+            if let Some(reg) = registry {
+                if let Some(mut resolved_schema) = reg.schemas.get(dref_str) {
+                    let anchor_name = dref_str.split('#').nth(1).unwrap_or("");
+                    if resolved_schema.dynamic_anchor.as_deref() == Some(anchor_name) {
+                        for &(scope_anchor, scope_schema) in dynamic_scope.iter() {
+                            if scope_anchor == anchor_name {
+                                resolved_schema = scope_schema;
+                                break;
+                            }
+                        }
+                    }
+                    match resolved_schema.validate_internal(
+                        val,
+                        registry,
+                        options,
+                        depth + 1,
+                        warnings,
+                        dynamic_scope,
+                    ) {
+                        Ok(sub_state) => state.merge(&sub_state),
+                        Err(mut sub_errs) => {
+                            errors.push(ValidationError::UnresolvedReference(dref_str.clone()));
+                            check_early_stop!();
+                            errors.append(&mut sub_errs);
+                        }
+                    }
+                } else {
+                    errors.push(ValidationError::UnresolvedReference(dref_str.clone()));
+                    check_early_stop!();
+                }
+            } else {
+                errors.push(ValidationError::UnresolvedReference(dref_str.clone()));
+                check_early_stop!();
+            }
         }
 
         // --- Step 2: Constant and Enum matching ---
         if let Some(enums) = &self.enum_values
-            && !enums.contains(val)
-        {
-            errors.push(ValidationError::NotInEnum);
-            check_early_stop!();
-        }
+            && !enums.iter().any(|e| Self::values_equal(e, val)) {
+                errors.push(ValidationError::NotInEnum);
+                check_early_stop!();
+            }
         if let Some(c) = &self.const_value
-            && c != val
-        {
-            errors.push(ValidationError::ConstMismatch);
-            check_early_stop!();
-        }
+            && !Self::values_equal(c, val) {
+                errors.push(ValidationError::ConstMismatch);
+                check_early_stop!();
+            }
 
         // --- Step 3: Type validation ---
         let mut type_matched = false;
@@ -920,11 +1308,10 @@ impl LightSchema {
                     SchemaType::Integer => {
                         if val.is_i64() || val.is_u64() {
                             type_matched = true;
-                        } else if let Some(f) = val.as_f64() {
-                            if f.fract() == 0.0 {
+                        } else if let Some(f) = val.as_f64()
+                            && (f as i64) as f64 == f {
                                 type_matched = true;
                             }
-                        }
                     }
                     SchemaType::Number => {
                         if val.is_number() {
@@ -996,7 +1383,7 @@ impl LightSchema {
 
             for (dep_key, schema) in &obj.dependent_schemas {
                 if obj_val.contains_key(dep_key) {
-                    match schema.validate_internal(val, registry, options, depth + 1, warnings) {
+                    match schema.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(sub_errs) => {
                             errors.push(ValidationError::DependentSchemaFailed(dep_key.clone()));
@@ -1023,6 +1410,7 @@ impl LightSchema {
                         options,
                         depth + 1,
                         warnings,
+                        dynamic_scope,
                     )
                 {
                     errors.push(ValidationError::InvalidPropertyName(k.clone()));
@@ -1041,7 +1429,7 @@ impl LightSchema {
                 let mut matched_properties = false;
                 if let Some(prop_schema) = obj.properties.get(k) {
                     matched_properties = true;
-                    match prop_schema.validate_internal(v, registry, options, depth + 1, warnings) {
+                    match prop_schema.validate_internal(v, registry, options, depth + 1, warnings, dynamic_scope) {
                         Ok(_) => {
                             state.evaluated_properties.insert(k.clone());
                         }
@@ -1069,7 +1457,8 @@ impl LightSchema {
                             options,
                             depth + 1,
                             warnings,
-                        ) {
+                        dynamic_scope,
+                    ) {
                             Ok(_) => {
                                 state.evaluated_properties.insert(k.clone());
                             }
@@ -1096,7 +1485,8 @@ impl LightSchema {
                             options,
                             depth + 1,
                             warnings,
-                        ) {
+                        dynamic_scope,
+                    ) {
                             Ok(_) => {
                                 state.evaluated_properties.insert(k.clone());
                             }
@@ -1158,7 +1548,7 @@ impl LightSchema {
             let mut validated_indices = 0;
             if let Some(prefixes) = &arr.prefix_items {
                 for (idx, (schema, item)) in prefixes.iter().zip(arr_val.iter()).enumerate() {
-                    match schema.validate_internal(item, registry, options, depth + 1, warnings) {
+                    match schema.validate_internal(item, registry, options, depth + 1, warnings, dynamic_scope) {
                         Ok(_) => {
                             state.evaluated_items.insert(idx);
                         }
@@ -1188,6 +1578,7 @@ impl LightSchema {
                         options,
                         depth + 1,
                         warnings,
+                        dynamic_scope,
                     ) {
                         Ok(_) => {
                             state.evaluated_items.insert(idx);
@@ -1213,7 +1604,7 @@ impl LightSchema {
                 let mut contains_count = 0;
                 for (idx, item) in arr_val.iter().enumerate() {
                     if contains_schema
-                        .validate_internal(item, registry, options, depth + 1, warnings)
+                        .validate_internal(item, registry, options, depth + 1, warnings, dynamic_scope)
                         .is_ok()
                     {
                         contains_count += 1;
@@ -1292,6 +1683,7 @@ impl LightSchema {
                             is_valid = false;
                         }
                     }
+                    SchemaFormat::Unknown(_) => {}
                 }
 
                 if !is_valid {
@@ -1301,6 +1693,7 @@ impl LightSchema {
                         SchemaFormat::Uri => "uri",
                         SchemaFormat::Email(_) => "email",
                         SchemaFormat::DateTime => "date-time",
+                        SchemaFormat::Unknown(s) => s.as_str(),
                     };
                     let err = ValidationError::InvalidFormat(format_name.to_string());
                     if options.format_assertions {
@@ -1357,23 +1750,27 @@ impl LightSchema {
         if let Some(log) = &self.log {
             if !log.any_of.is_empty() {
                 let mut any_valid = false;
+                let mut any_errs = Vec::new();
                 for branch in &log.any_of {
-                    if let Ok(sub_state) =
-                        branch.validate_internal(val, registry, options, depth + 1, warnings)
-                    {
-                        state.merge(&sub_state);
-                        any_valid = true;
-                        break;
+                    match branch.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
+                        Ok(sub_state) => {
+                            state.merge(&sub_state);
+                            any_valid = true;
+                            break;
+                        }
+                        Err(e) => {
+                            any_errs.push(e);
+                        }
                     }
                 }
                 if !any_valid {
-                    errors.push(ValidationError::AnyOfFailed);
+                    errors.push(ValidationError::AnyOfFailed(any_errs.clone()));
                     check_early_stop!();
                 }
             }
             if !log.all_of.is_empty() {
                 for branch in &log.all_of {
-                    match branch.validate_internal(val, registry, options, depth + 1, warnings) {
+                    match branch.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(mut sub_errs) => {
                             errors.push(ValidationError::AllOfFailed);
@@ -1388,7 +1785,7 @@ impl LightSchema {
                 let mut best_state = EvaluationState::default();
                 for branch in &log.one_of {
                     if let Ok(sub_state) =
-                        branch.validate_internal(val, registry, options, depth + 1, warnings)
+                        branch.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope)
                     {
                         matches += 1;
                         best_state = sub_state;
@@ -1403,7 +1800,7 @@ impl LightSchema {
             }
             if let Some(not_schema) = &log.not
                 && not_schema
-                    .validate_internal(val, registry, options, depth + 1, warnings)
+                    .validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope)
                     .is_ok()
             {
                 errors.push(ValidationError::NotFailed);
@@ -1411,7 +1808,7 @@ impl LightSchema {
             }
 
             if let Some(cond_if) = &log.conditional_if {
-                let if_res = cond_if.validate_internal(val, registry, options, depth + 1, warnings);
+                let if_res = cond_if.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope);
                 if let Ok(if_state) = if_res {
                     state.merge(&if_state);
                     if let Some(cond_then) = &log.conditional_then {
@@ -1421,7 +1818,8 @@ impl LightSchema {
                             options,
                             depth + 1,
                             warnings,
-                        ) {
+                        dynamic_scope,
+                    ) {
                             Ok(sub_state) => state.merge(&sub_state),
                             Err(mut sub_errs) => {
                                 errors.push(ValidationError::ThenFailed);
@@ -1431,7 +1829,7 @@ impl LightSchema {
                         }
                     }
                 } else if let Some(cond_else) = &log.conditional_else {
-                    match cond_else.validate_internal(val, registry, options, depth + 1, warnings) {
+                    match cond_else.validate_internal(val, registry, options, depth + 1, warnings, dynamic_scope) {
                         Ok(sub_state) => state.merge(&sub_state),
                         Err(mut sub_errs) => {
                             errors.push(ValidationError::ElseFailed);
@@ -1450,7 +1848,7 @@ impl LightSchema {
         {
             for (k, v) in obj_val {
                 if !state.evaluated_properties.contains(k) {
-                    match uneval.validate_internal(v, registry, options, depth + 1, warnings) {
+                    match uneval.validate_internal(v, registry, options, depth + 1, warnings, dynamic_scope) {
                         Ok(_) => {
                             state.evaluated_properties.insert(k.clone());
                         }
@@ -1477,7 +1875,7 @@ impl LightSchema {
         {
             for (idx, item) in arr_val.iter().enumerate() {
                 if !state.evaluated_items.contains(&idx) {
-                    match uneval.validate_internal(item, registry, options, depth + 1, warnings) {
+                    match uneval.validate_internal(item, registry, options, depth + 1, warnings, dynamic_scope) {
                         Ok(_) => {
                             state.evaluated_items.insert(idx);
                         }
