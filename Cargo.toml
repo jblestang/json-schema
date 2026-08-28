@@ -1,6 +1,6 @@
 [package]
 name = "light-json-schema"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "A strictly no_std JSON Schema validator for embedded and lightweight async systems"
 license = "MIT"

@@ -3167,9 +3167,19 @@ impl LightSchema {
             {
                 // Use a safer tolerance to prevent precision errors
                 let quotient = n / mult;
-                let rounded = quotient.round();
-                let diff = (quotient - rounded).abs();
-                if diff > 1e-7 {
+                // no_std fallback for float methods
+                let mut rounded = if quotient < 0.0 {
+                    (quotient - 0.5) as i64 as f64
+                } else {
+                    (quotient + 0.5) as i64 as f64
+                };
+                if quotient > 9007199254740992.0 || quotient < -9007199254740992.0 {
+                    rounded = quotient; // Beyond safe integer limit, fractional part is 0
+                }
+                let diff = quotient - rounded;
+                let abs_diff = if diff < 0.0 { -diff } else { diff };
+
+                if abs_diff > 1e-7 {
                     errors.push(ValidationError::MultipleOf(mult));
                     check_early_stop!();
                 }
