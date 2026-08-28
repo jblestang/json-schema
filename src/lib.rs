@@ -1704,12 +1704,13 @@ impl LightSchema {
         let mut current_base = base_uri.clone();
         let mut new_pointer = pointer.to_string();
 
-        if let Some(id_str) = val.get("$id").and_then(|v| v.as_str())
-            && let Ok(joined) = base_uri.join(id_str)
-            && !id_str.starts_with('#')
-        {
-            current_base = joined;
-            new_pointer = String::new();
+        if let Some(id_str) = val.get("$id").and_then(|v| v.as_str()) {
+            if let Ok(joined) = base_uri.join(id_str) {
+                if !id_str.starts_with('#') {
+                    current_base = joined;
+                    new_pointer = String::new();
+                }
+            }
         }
 
         if let Some(defs) = val.get("$defs").and_then(|p| p.as_object()) {
@@ -2385,10 +2386,13 @@ impl LightSchema {
     /// // Detailed example of usage is deferred to higher-level integration tests.
     /// ```
     pub fn parse_strict(val: &Value) -> Result<Self, SchemaParseError> {
-        static METASCHEMA_REGISTRY: once_cell::race::OnceBox<SchemaRegistry> =
-            once_cell::race::OnceBox::new();
+        static METASCHEMA_REGISTRY: core::sync::atomic::AtomicPtr<SchemaRegistry> =
+            core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-        let registry = METASCHEMA_REGISTRY.get_or_init(|| {
+        let ptr = METASCHEMA_REGISTRY.load(core::sync::atomic::Ordering::Acquire);
+        let registry = if !ptr.is_null() {
+            unsafe { &*ptr }
+        } else {
             let meta_json = include_str!("metaschemas.json");
             let schemas_map: alloc::collections::BTreeMap<String, Value> =
                 serde_json::from_str(meta_json).expect("Invalid metaschemas JSON");
@@ -2396,15 +2400,27 @@ impl LightSchema {
             let mut reg = SchemaRegistry::new();
             for (uri, schema_val) in schemas_map {
                 let base_uri = url::Url::parse(&uri).unwrap();
-                // Parse and add to registry
                 if let Ok(schema) =
                     LightSchema::parse_with_context(&schema_val, &mut reg, &base_uri, "")
                 {
                     reg.schemas.insert(uri.to_string(), schema);
                 }
             }
-            alloc::boxed::Box::new(reg)
-        });
+            
+            let new_ptr = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(reg));
+            match METASCHEMA_REGISTRY.compare_exchange(
+                core::ptr::null_mut(),
+                new_ptr,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => unsafe { &*new_ptr },
+                Err(existing_ptr) => {
+                    unsafe { drop(alloc::boxed::Box::from_raw(new_ptr)) };
+                    unsafe { &*existing_ptr }
+                }
+            }
+        };
 
         // Determine which metaschema to validate against
         let schema_uri = val
